@@ -20,11 +20,8 @@
 # Requires: keys generated via setup_keys.py
 # ==========================================
 
-import unittest
-import time
-import math
-import sys
 from openfhe import *
+import test_logger
 
 # ==========================================
 # Config
@@ -986,7 +983,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestLondonCentral20Users))
     suite.addTests(loader.loadTestsFromTestCase(TestMumbai20Users))
 
-    runner = unittest.TextTestRunner(verbosity=2)
+    runner = test_logger.get_runner()
     result = runner.run(suite)
 
     total_time = time.time() - start
