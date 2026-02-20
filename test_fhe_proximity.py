@@ -16,11 +16,8 @@
 #       may take several minutes to complete.
 # ==========================================
 
-import unittest
-import time
-import math
-import sys
 from openfhe import *
+import test_logger
 
 # ==========================================
 # Config
@@ -882,7 +879,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestTournament10Users))
     suite.addTests(loader.loadTestsFromTestCase(TestTournamentMax20Users))
 
-    runner = unittest.TextTestRunner(verbosity=2)
+    runner = test_logger.get_runner()
     result = runner.run(suite)
 
     total_time = time.time() - start
