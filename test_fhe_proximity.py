@@ -51,9 +51,6 @@ def load_all():
     if not cc.DeserializeEvalMultKey(f"{KEYS_DIR}/evalmultkey.bin", BINARY):
         raise RuntimeError("Failed to load eval mult key")
 
-    if not cc.DeserializeEvalAutomorphismKey(f"{KEYS_DIR}/evalrotatekey.bin", BINARY):
-        raise RuntimeError("Failed to load eval rotate key")
-
     return cc, pk, sk
 
 
@@ -858,8 +855,8 @@ if __name__ == "__main__":
     print("FHE Proximity Matching — Comprehensive Test Suite")
     print("=" * 60)
     print(f"  BATCH_SIZE={BATCH_SIZE}, MAX_USERS={MAX_USERS}, MAX_COORD={MAX_COORD}")
-    print(f"  Depth=20, Scoring approach: selector(x) = 0.5 + 0.1125x - 0.00084375x³")
-    print(f"  Depth budget: 5 levels (independent of user count)")
+    print(f"  Depth=7, Scoring approach: selector(x) = 0.5 + 0.1125x - 0.00084375x³")
+    print(f"  Depth budget: 5 levels out of 7 (independent of user count)")
     print()
     print("WARNING: FHE operations are computationally expensive.")
     print("  2-3 user tests:  ~5-15s each")

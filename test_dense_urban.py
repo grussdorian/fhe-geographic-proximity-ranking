@@ -55,9 +55,6 @@ def load_all():
     if not cc.DeserializeEvalMultKey(f"{KEYS_DIR}/evalmultkey.bin", BINARY):
         raise RuntimeError("Failed to load eval mult key")
 
-    if not cc.DeserializeEvalAutomorphismKey(f"{KEYS_DIR}/evalrotatekey.bin", BINARY):
-        raise RuntimeError("Failed to load eval rotate key")
-
     return cc, pk, sk
 
 

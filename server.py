@@ -20,11 +20,11 @@
 # Coordinates are replicated across all slots so the selector
 # broadcasts naturally to multiply the one-hot vectors.
 #
-# Depth budget (depth 20):
+# Depth budget (depth 7):
 #   - Distance: 1 ct-ct mult level
 #   - Selector polynomial: 2 ct-ct + 1 pt-ct = 3 levels
 #   - Score × ID: 1 ct-ct level
-#   - Total: 5 levels ≤ 20 ✓  (independent of user count!)
+#   - Total: 5 levels ≤ 7 ✓  (independent of user count!)
 #
 # Server NEVER sees plaintext locations or distances.
 # ==========================================
@@ -52,9 +52,6 @@ def load_context():
 
     if not cc.DeserializeEvalMultKey(f"{KEYS_DIR}/evalmultkey.bin", BINARY):
         raise RuntimeError("Failed to load eval mult key")
-
-    if not cc.DeserializeEvalAutomorphismKey(f"{KEYS_DIR}/evalrotatekey.bin", BINARY):
-        raise RuntimeError("Failed to load eval rotate key")
 
     return cc
 
