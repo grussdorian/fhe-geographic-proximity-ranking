@@ -2,9 +2,9 @@
 # ==========================================
 # test_dense_urban.py
 #
-# FHE proximity tests focused on densely
-# populated urban areas where users are
-# within the same city, often just blocks
+# Threshold FHE proximity tests focused on
+# densely populated urban areas where users
+# are within the same city, often just blocks
 # or hundreds of meters apart.
 #
 # Scenarios:
@@ -16,8 +16,11 @@
 #   - Same-block precision (users <50m apart)
 #   - Mixed: one dense cluster + a few outliers
 #
+# Security:
+#   - ALL parties must participate in decryption
+#   - Threshold N-of-N (no single party can decrypt)
+#
 # Run:  python3.13 test_dense_urban.py
-# Requires: keys generated via setup_keys.py
 # ==========================================
 
 from openfhe import *
@@ -31,74 +34,106 @@ import math
 # Config
 # ==========================================
 
-KEYS_DIR = "fhe_keys"
 BATCH_SIZE = 32
 MAX_COORD = 180.0
 MAX_USERS = 20
-
-# ==========================================
-# Load crypto context + all keys (once)
-# ==========================================
-
-def load_all():
-    cc, ok = DeserializeCryptoContext(f"{KEYS_DIR}/cryptocontext.bin", BINARY)
-    if not ok:
-        raise RuntimeError("Failed to load crypto context. Run setup_keys.py first!")
-
-    pk, ok = DeserializePublicKey(f"{KEYS_DIR}/publickey.bin", BINARY)
-    if not ok:
-        raise RuntimeError("Failed to load public key")
-
-    sk, ok = DeserializePrivateKey(f"{KEYS_DIR}/secretkey.bin", BINARY)
-    if not ok:
-        raise RuntimeError("Failed to load secret key")
-
-    if not cc.DeserializeEvalMultKey(f"{KEYS_DIR}/evalmultkey.bin", BINARY):
-        raise RuntimeError("Failed to load eval mult key")
-
-    return cc, pk, sk
-
-
-print("Loading crypto context and keys...")
-t0 = time.time()
-cc, public_key, secret_key = load_all()
-print(f"  Loaded in {time.time() - t0:.1f}s")
+NUM_BASE_PARTIES = 3
 
 
 # ==========================================
-# FHE helpers
+# Threshold FHE infrastructure
 # ==========================================
 
-def encrypt_location(lat, lon):
-    nlat = float(lat) / MAX_COORD
-    nlon = float(lon) / MAX_COORD
-    lat_pt = cc.MakeCKKSPackedPlaintext([nlat] * BATCH_SIZE)
-    lon_pt = cc.MakeCKKSPackedPlaintext([nlon] * BATCH_SIZE)
-    return cc.Encrypt(public_key, lat_pt), cc.Encrypt(public_key, lon_pt)
+def create_context():
+    params = CCParamsCKKSRNS()
+    params.SetMultiplicativeDepth(7)
+    params.SetScalingModSize(50)
+    params.SetFirstModSize(60)
+    params.SetBatchSize(BATCH_SIZE)
+    params.SetSecurityLevel(HEStd_128_classic)
+
+    cc = GenCryptoContext(params)
+    cc.Enable(PKE)
+    cc.Enable(KEYSWITCH)
+    cc.Enable(LEVELEDSHE)
+    cc.Enable(ADVANCEDSHE)
+    cc.Enable(MULTIPARTY)
+    return cc
 
 
-def encrypt_onehot_id(slot_index):
-    vec = [0.0] * BATCH_SIZE
-    vec[slot_index] = 1.0
-    pt = cc.MakeCKKSPackedPlaintext(vec)
-    return cc.Encrypt(public_key, pt)
+def generate_threshold_keys(cc, num_parties):
+    keypairs = []
+    kp1 = cc.KeyGen()
+    keypairs.append(kp1)
+    for i in range(1, num_parties):
+        kp_i = cc.MultipartyKeyGen(keypairs[-1].publicKey)
+        keypairs.append(kp_i)
+    joint_pk = keypairs[-1].publicKey
+    return keypairs, joint_pk
 
 
-def decrypt_vector(ct, length=BATCH_SIZE):
-    pt = cc.Decrypt(secret_key, ct)
-    pt.SetLength(length)
+def generate_eval_mult_key(cc, keypairs):
+    n = len(keypairs)
+    joint_pk = keypairs[-1].publicKey
+    pk_tag = joint_pk.GetKeyTag()
+
+    lead_share = cc.KeySwitchGen(keypairs[0].secretKey, keypairs[0].secretKey)
+    shares = [lead_share]
+    for i in range(1, n):
+        share_i = cc.MultiKeySwitchGen(
+            keypairs[i].secretKey, keypairs[i].secretKey, lead_share
+        )
+        shares.append(share_i)
+
+    combined = shares[0]
+    for i in range(1, n):
+        combined = cc.MultiAddEvalKeys(combined, shares[i], pk_tag)
+
+    mult_shares = []
+    for i in range(n):
+        mult_i = cc.MultiMultEvalKey(keypairs[i].secretKey, combined, pk_tag)
+        mult_shares.append(mult_i)
+
+    final = mult_shares[0]
+    for i in range(1, n):
+        final = cc.MultiAddEvalMultKeys(final, mult_shares[i], final.GetKeyTag())
+
+    cc.InsertEvalMultKey([final])
+
+
+def threshold_decrypt(cc, keypairs, ciphertext):
+    partials = []
+    lead_partial = cc.MultipartyDecryptLead([ciphertext], keypairs[0].secretKey)
+    partials.append(lead_partial[0])
+    for i in range(1, len(keypairs)):
+        main_partial = cc.MultipartyDecryptMain([ciphertext], keypairs[i].secretKey)
+        partials.append(main_partial[0])
+    pt = cc.MultipartyDecryptFusion(partials)
+    pt.SetLength(BATCH_SIZE)
     return list(pt.GetRealPackedValue())
 
 
-def compute_distance(x1, y1, x2, y2):
-    dx = cc.EvalSub(x1, x2)
-    dy = cc.EvalSub(y1, y2)
-    dx2 = cc.EvalMult(dx, dx)
-    dy2 = cc.EvalMult(dy, dy)
-    return cc.EvalAdd(dx2, dy2)
+def partial_decrypt(cc, keypairs, ciphertext, party_indices):
+    """Attempt decryption with a SUBSET of parties.
+    Returns garbage values or raises RuntimeError."""
+    partials = []
+    for idx in party_indices:
+        if idx == 0:
+            p = cc.MultipartyDecryptLead([ciphertext], keypairs[0].secretKey)
+        else:
+            p = cc.MultipartyDecryptMain([ciphertext], keypairs[idx].secretKey)
+        partials.append(p[0])
+    # May raise RuntimeError("approximation error is too high")
+    pt = cc.MultipartyDecryptFusion(partials)
+    pt.SetLength(BATCH_SIZE)
+    return list(pt.GetRealPackedValue())
 
 
-def compute_selector(diff):
+# ==========================================
+# Scoring helpers
+# ==========================================
+
+def compute_selector(cc, diff):
     x2 = cc.EvalMult(diff, diff)
     inner = cc.EvalMult(x2, -0.00084375)
     inner = cc.EvalAdd(inner, 0.1125)
@@ -106,36 +141,52 @@ def compute_selector(diff):
     return cc.EvalAdd(product, 0.5)
 
 
-def find_nearest_by_scoring(target_x, target_y, opponents):
+def find_nearest_by_scoring(cc, opponents):
     n = len(opponents)
-
     if n == 1:
-        return opponents[0][2]
+        return opponents[0][1]
 
-    dists = []
-    for x_ct, y_ct, _ in opponents:
-        d = compute_distance(target_x, target_y, x_ct, y_ct)
-        dists.append(d)
-
+    dists = [d for d, _ in opponents]
     scores = [None] * n
     for i in range(n):
         for j in range(i + 1, n):
             diff = cc.EvalSub(dists[j], dists[i])
-            sel_ji = compute_selector(diff)
+            sel_ji = compute_selector(cc, diff)
             sel_ij = cc.EvalSub(1.0, sel_ji)
             scores[i] = cc.EvalAdd(scores[i], sel_ji) if scores[i] is not None else sel_ji
             scores[j] = cc.EvalAdd(scores[j], sel_ij) if scores[j] is not None else sel_ij
 
-    result = cc.EvalMult(scores[0], opponents[0][2])
+    result = cc.EvalMult(scores[0], opponents[0][1])
     for i in range(1, n):
-        result = cc.EvalAdd(result, cc.EvalMult(scores[i], opponents[i][2]))
-
+        result = cc.EvalAdd(result, cc.EvalMult(scores[i], opponents[i][1]))
     return result
 
 
+def compute_distance_local(cc, enc_lat, enc_lon, lat, lon):
+    nlat = lat / MAX_COORD
+    nlon = lon / MAX_COORD
+    lat_pt = cc.MakeCKKSPackedPlaintext([nlat] * BATCH_SIZE)
+    lon_pt = cc.MakeCKKSPackedPlaintext([nlon] * BATCH_SIZE)
+    dlat = cc.EvalSub(enc_lat, lat_pt)
+    dlon = cc.EvalSub(enc_lon, lon_pt)
+    dlat2 = cc.EvalMult(dlat, dlat)
+    dlon2 = cc.EvalMult(dlon, dlon)
+    return cc.EvalAdd(dlat2, dlon2)
+
+
 # ==========================================
-# Plaintext helpers
+# Plaintext reference helpers
 # ==========================================
+
+def haversine_m(loc1, loc2):
+    R = 6371000.0
+    lat1, lon1 = math.radians(loc1[0]), math.radians(loc1[1])
+    lat2, lon2 = math.radians(loc2[0]), math.radians(loc2[1])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 
 def plaintext_sq_dist(loc1, loc2):
     dlat = (loc1[0] - loc2[0]) / MAX_COORD
@@ -148,260 +199,230 @@ def plaintext_nearest(target, others):
     return min(range(len(dists)), key=lambda i: dists[i])
 
 
-def haversine_m(loc1, loc2):
-    """Great-circle distance in METERS."""
-    R = 6_371_000.0
-    lat1, lon1 = math.radians(loc1[0]), math.radians(loc1[1])
-    lat2, lon2 = math.radians(loc2[0]), math.radians(loc2[1])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def fmt_dist(loc1, loc2):
-    """Human-readable distance string."""
-    m = haversine_m(loc1, loc2)
-    return f"{m:.0f}m" if m < 1000 else f"{m/1000:.2f}km"
-
-
 # ==========================================
-# Scoring helper
+# Full scoring pipeline (threshold FHE)
 # ==========================================
 
-def run_scoring(target_idx, locations, names=None):
-    """
-    Run pairwise scoring from target_idx against all others.
-    Returns (winner_slot, decrypted_vector, elapsed_seconds).
-    """
-    n = len(locations)
+def run_scoring(target_idx, locs, names, cc=None, keypairs=None, joint_pk=None):
+    """Run full threshold FHE proximity pipeline.
+    Returns (winner_slot, values, elapsed)."""
+    n = len(locs)
     assert n <= BATCH_SIZE
 
-    encrypted = []
-    for i, (lat, lon) in enumerate(locations):
-        lat_ct, lon_ct = encrypt_location(lat, lon)
-        id_ct = encrypt_onehot_id(i)
-        encrypted.append((lat_ct, lon_ct, id_ct))
+    if cc is None:
+        cc = _cc
+        keypairs = _keypairs
+        joint_pk = _joint_pk
 
-    target_lat, target_lon, _ = encrypted[target_idx]
+    # Initiator encrypts
+    init_lat, init_lon = locs[target_idx]
+    nlat = init_lat / MAX_COORD
+    nlon = init_lon / MAX_COORD
+    lat_pt = cc.MakeCKKSPackedPlaintext([nlat] * BATCH_SIZE)
+    lon_pt = cc.MakeCKKSPackedPlaintext([nlon] * BATCH_SIZE)
+    enc_lat = cc.Encrypt(joint_pk, lat_pt)
+    enc_lon = cc.Encrypt(joint_pk, lon_pt)
 
+    # Each party computes distance locally
     opponents = []
-    for i, (lat_ct, lon_ct, id_ct) in enumerate(encrypted):
+    for i in range(n):
         if i == target_idx:
             continue
-        opponents.append((lat_ct, lon_ct, id_ct))
+        dist_ct = compute_distance_local(cc, enc_lat, enc_lon, locs[i][0], locs[i][1])
+        vec = [0.0] * BATCH_SIZE
+        vec[i] = 1.0
+        id_pt = cc.MakeCKKSPackedPlaintext(vec)
+        id_ct = cc.Encrypt(joint_pk, id_pt)
+        opponents.append((dist_ct, id_ct))
 
     t0 = time.time()
-    winner_id_ct = find_nearest_by_scoring(target_lat, target_lon, opponents)
+    result_ct = find_nearest_by_scoring(cc, opponents)
     elapsed = time.time() - t0
 
-    values = decrypt_vector(winner_id_ct)
+    values = threshold_decrypt(cc, keypairs, result_ct)
     winner_slot = max(range(len(values)), key=lambda i: values[i])
 
     return winner_slot, values, elapsed
 
 
-def verify_nearest(test_case, target_idx, locations, names, label,
-                   sq_tolerance=0.25):
+def verify_nearest(test_case, target_idx, locs, names, label, sq_tolerance=0.25):
+    """Verify FHE picks correct nearest neighbor.
+    Returns the winning slot index.
+
+    sq_tolerance: relative tolerance on squared distances for near-ties.
+    If the top-2 are within sq_tolerance of each other, accept either.
     """
-    Verify FHE nearest matches plaintext nearest.
+    n = len(locs)
+    target = locs[target_idx]
 
-    Because the CKKS selector polynomial returns ≈0.5 when two normalised
-    squared distances are very close, the FHE result may pick *any*
-    candidate whose squared distance is within `sq_tolerance` (relative,
-    default 25 %) of the true nearest.  That is a correct outcome — the
-    distances are indistinguishable under FHE noise.
-    """
-    n = len(locations)
-    slots = [i for i in range(n) if i != target_idx]
-    others = [locations[i] for i in slots]
-    expected_idx = plaintext_nearest(locations[target_idx], others)
-    expected_slot = slots[expected_idx]
+    # Compute plaintext distances
+    pt_dists = []
+    for i in range(n):
+        if i == target_idx:
+            continue
+        sq = plaintext_sq_dist(target, locs[i])
+        m = haversine_m(target, locs[i])
+        pt_dists.append((i, sq, m))
+    pt_dists.sort(key=lambda x: x[1])
 
-    # Compute all squared distances and sort
-    dists = [(i, plaintext_sq_dist(locations[target_idx], locations[i]),
-              haversine_m(locations[target_idx], locations[i]))
-             for i in range(n) if i != target_idx]
-    dists.sort(key=lambda x: x[1])
-    top3 = dists[:3]
+    expected_slot = pt_dists[0][0]
+    expected_sq = pt_dists[0][1]
 
-    best_sq = dists[0][1]  # smallest squared distance
-
-    # Build set of acceptable winners: any slot whose sq dist is within
-    # tolerance of the true nearest (accounts for CKKS polynomial limits)
-    acceptable = set()
-    for idx, sq, _ in dists:
-        if best_sq == 0:
-            if sq == 0:
-                acceptable.add(idx)
-        elif sq <= best_sq * (1.0 + sq_tolerance):
-            acceptable.add(idx)
+    # Acceptable slots (within tolerance for near-ties)
+    acceptable = {expected_slot}
+    for i in range(1, len(pt_dists)):
+        ratio = pt_dists[i][1] / expected_sq if expected_sq > 0 else float('inf')
+        if ratio - 1.0 < sq_tolerance:
+            acceptable.add(pt_dists[i][0])
         else:
-            break  # sorted, no need to check further
+            break
 
-    print(f"\n  [{label}] {names[target_idx]} — top 3 nearest:")
-    for rank, (idx, sq, m) in enumerate(top3):
-        marker = " <--" if idx == expected_slot else ""
-        if idx in acceptable and idx != expected_slot:
-            marker += " (acceptable)"
-        dist_str = f"{m:.0f}m" if m < 1000 else f"{m/1000:.2f}km"
-        print(f"    {rank+1}. {names[idx]:30s} (slot {idx:2d}): {dist_str:>10s}  sq={sq:.2e}{marker}")
-
-    winner, vals, elapsed = run_scoring(target_idx, locations, names)
+    winner, values, elapsed = run_scoring(target_idx, locs, names)
 
     test_case.assertIn(
         winner, acceptable,
-        f"{label} {names[target_idx]}: expected one of "
-        f"{[f'{names[s]} (slot {s})' for s in acceptable]}, "
+        f"[{label}] {names[target_idx]} (slot {target_idx}): "
+        f"expected one of {[names[s] for s in acceptable]}, "
         f"got {names[winner]} (slot {winner})"
     )
 
-    top_slots = sorted(enumerate(vals), key=lambda x: -x[1])[:3]
-    status = "OK" if winner == expected_slot else f"OK (tied — {names[winner]} also valid)"
-    print(f"  [{label}] Winner: {names[winner]} (slot {winner})  ({elapsed:.1f}s)  {status}")
-    for rank, (idx, val) in enumerate(top_slots):
-        print(f"    rank {rank+1}: slot {idx:2d} ({names[idx]:30s}) = {val:.4f}")
+    print(f"  [{label}] {names[target_idx]} → {names[winner]} "
+          f"({haversine_m(target, locs[winner]):.0f}m, {elapsed:.1f}s)  OK")
 
     return winner
 
 
-# ======================================================================
-# REAL-WORLD DENSE URBAN LOCATIONS
-#
-# All coordinates verified to 5 decimal places.
-# Distances shown are approximate haversine.
-# ======================================================================
+# ==========================================
+# Create shared 3-party threshold context
+# ==========================================
 
-# ------------------------------------------------------------------
-# MANHATTAN, NEW YORK CITY
-# 20 locations across Midtown, Downtown, UES, UWS, Village
-# Typical inter-point distance: 200m to 5km
-# ------------------------------------------------------------------
+print("Creating threshold FHE context (3-party) for dense urban tests...")
+t0 = time.time()
+_cc = create_context()
+_keypairs, _joint_pk = generate_threshold_keys(_cc, NUM_BASE_PARTIES)
+generate_eval_mult_key(_cc, _keypairs)
+print(f"  Ready in {time.time() - t0:.1f}s")
+
+
+# ==========================================
+# Dense city datasets (20 locations each)
+# ==========================================
+
 MANHATTAN = {
     "names": [
         "Times Square",              # 0
-        "Bryant Park",               # 1  ~350m from TS
-        "Grand Central",             # 2  ~700m from TS
-        "Empire State Building",     # 3  ~1.1km from TS
-        "Rockefeller Center",        # 4  ~350m from TS
-        "MoMA",                      # 5  ~500m from Rockefeller
-        "Carnegie Hall",             # 6  ~600m from TS
-        "Columbus Circle",           # 7  ~900m from TS
-        "Penn Station",              # 8  ~600m from TS
-        "Madison Sq Garden",         # 9  ~700m from Penn
-        "Flatiron Building",         # 10 ~1.5km from TS
-        "Union Square",              # 11 ~2.3km from TS
-        "Washington Sq Park",        # 12 ~3km from TS
-        "Wall Street",               # 13 ~5km from TS
-        "Brooklyn Bridge",           # 14 ~5.5km from TS
-        "One World Trade",           # 15 ~5km from TS
-        "High Line (14th St)",       # 16 ~2.5km from TS
-        "Met Museum",                # 17 ~2.5km NE of TS
-        "Lincoln Center",            # 18 ~1.3km from TS
-        "Central Park Zoo",          # 19 ~1.5km from TS
+        "Bryant Park",               # 1  ~350m
+        "Grand Central",             # 2  ~1km
+        "Empire State",              # 3  ~1.1km
+        "Rockefeller Center",        # 4  ~600m
+        "MoMA",                      # 5  ~800m
+        "Carnegie Hall",             # 6  ~900m
+        "Columbus Circle",           # 7  ~1.2km
+        "Penn Station",              # 8  ~900m
+        "Madison Sq Garden",         # 9  ~900m (right next to Penn)
+        "Flatiron Building",         # 10 ~1.8km
+        "Union Square",              # 11 ~2.5km
+        "Washington Sq Park",        # 12 ~3km
+        "Wall Street",               # 13 ~6km
+        "Brooklyn Bridge",           # 14 ~5km
+        "One World Trade",           # 15 ~5.5km
+        "High Line (14th)",          # 16 ~2.5km
+        "Met Museum",                # 17 ~3km
+        "Intrepid Museum",           # 18 ~1.5km
+        "Central Park Zoo",          # 19 ~2km
     ],
     "locs": [
-        (40.75800, -73.98557),  # 0  Times Square
-        (40.75360, -73.98340),  # 1  Bryant Park
-        (40.75270, -73.97720),  # 2  Grand Central
-        (40.74844, -73.98566),  # 3  Empire State Building
-        (40.75890, -73.97931),  # 4  Rockefeller Center
-        (40.76160, -73.97770),  # 5  MoMA
-        (40.76500, -73.97990),  # 6  Carnegie Hall
-        (40.76800, -73.98190),  # 7  Columbus Circle
-        (40.75060, -73.99350),  # 8  Penn Station
-        (40.75050, -73.99340),  # 9  Madison Sq Garden (adjacent to Penn)
-        (40.74110, -73.98970),  # 10 Flatiron Building
-        (40.73570, -73.99070),  # 11 Union Square
-        (40.73080, -73.99740),  # 12 Washington Square Park
-        (40.70600, -74.00900),  # 13 Wall Street
-        (40.70610, -73.99690),  # 14 Brooklyn Bridge
-        (40.71270, -74.01340),  # 15 One World Trade Center
-        (40.74240, -74.00680),  # 16 High Line (14th St entrance)
-        (40.77920, -73.96310),  # 17 Metropolitan Museum
-        (40.77220, -73.98350),  # 18 Lincoln Center
-        (40.76770, -73.97180),  # 19 Central Park Zoo
+        (40.75800, -73.98557),   # 0  Times Square
+        (40.75360, -73.98340),   # 1  Bryant Park
+        (40.75270, -73.97720),   # 2  Grand Central
+        (40.74844, -73.98566),   # 3  Empire State
+        (40.75890, -73.97931),   # 4  Rockefeller
+        (40.76160, -73.97770),   # 5  MoMA
+        (40.76500, -73.97990),   # 6  Carnegie Hall
+        (40.76800, -73.98190),   # 7  Columbus Circle
+        (40.75050, -73.99340),   # 8  Penn Station
+        (40.75060, -73.99350),   # 9  MSG (11m from Penn!)
+        (40.74110, -73.98970),   # 10 Flatiron
+        (40.73570, -73.99070),   # 11 Union Square
+        (40.73080, -73.99720),   # 12 Washington Sq Park
+        (40.70560, -74.00900),   # 13 Wall Street
+        (40.70608, -73.99691),   # 14 Brooklyn Bridge
+        (40.71270, -74.01340),   # 15 One World Trade
+        (40.74250, -74.00690),   # 16 High Line (14th)
+        (40.77920, -73.96340),   # 17 Met Museum
+        (40.76460, -73.99970),   # 18 Intrepid Museum
+        (40.76770, -73.97180),   # 19 Central Park Zoo
     ],
 }
 
-# ------------------------------------------------------------------
-# DOWNTOWN SAN FRANCISCO
-# 20 locations in the Financial District / SoMa / North Beach
-# Typical: 100m to 3km
-# ------------------------------------------------------------------
 SF_DOWNTOWN = {
     "names": [
         "Salesforce Tower",          # 0
-        "Transamerica Pyramid",      # 1
-        "Ferry Building",            # 2
-        "Moscone Center",            # 3
-        "Union Square SF",           # 4
-        "Chinatown Gate",            # 5
-        "Coit Tower",                # 6
-        "Embarcadero Center",        # 7
-        "SF City Hall",              # 8
-        "Twitter HQ (X)",            # 9
-        "Oracle Park",               # 10
-        "Pier 39",                   # 11
-        "Ghirardelli Square",        # 12
-        "Levi's Plaza",              # 13
-        "Rincon Park",               # 14
-        "South Park",                # 15
-        "AT&T Park Lot",             # 16  near Oracle Park
-        "SFMOMA",                    # 17
-        "Yerba Buena Gardens",       # 18
-        "Powell St Station",         # 19
+        "Ferry Building",            # 1  ~600m
+        "Transamerica Pyramid",      # 2  ~700m
+        "Moscone Center",            # 3  ~600m
+        "Union Square SF",           # 4  ~900m
+        "Powell St Station",         # 5  ~800m
+        "Coit Tower",                # 6  ~1.5km
+        "Embarcadero Center",        # 7  ~400m
+        "SF City Hall",              # 8  ~2km
+        "Twitter/X HQ",              # 9  ~1.8km
+        "Oracle Park",               # 10 ~1.5km
+        "Pier 39",                   # 11 ~2.5km
+        "Ghirardelli Square",        # 12 ~3km
+        "Palace of Fine Arts",       # 13 ~4km
+        "Lombard Street",            # 14 ~2.5km
+        "Chinatown Gate",            # 15 ~1km
+        "AT&T Park Lot",             # 16 ~1.5km
+        "SFMOMA",                    # 17 ~400m
+        "Yerba Buena Gardens",       # 18 ~500m
+        "Rincon Park",               # 19 ~300m
     ],
     "locs": [
         (37.78950, -122.39640),  # 0  Salesforce Tower
-        (37.79520, -122.40280),  # 1  Transamerica Pyramid
-        (37.79540, -122.39350),  # 2  Ferry Building
+        (37.79550, -122.39340),  # 1  Ferry Building
+        (37.79520, -122.40280),  # 2  Transamerica Pyramid
         (37.78390, -122.40060),  # 3  Moscone Center
-        (37.78780, -122.40760),  # 4  Union Square SF
-        (37.79060, -122.40570),  # 5  Chinatown Gate
-        (37.80220, -122.40590),  # 6  Coit Tower
-        (37.79490, -122.39870),  # 7  Embarcadero Center
-        (37.77920, -122.41920),  # 8  SF City Hall
-        (37.77670, -122.41650),  # 9  Twitter/X HQ (Market St)
-        (37.77840, -122.38920),  # 10 Oracle Park
-        (37.80870, -122.40980),  # 11 Pier 39
-        (37.80590, -122.42280),  # 12 Ghirardelli Square
-        (37.80050, -122.39980),  # 13 Levi's Plaza
-        (37.79080, -122.38850),  # 14 Rincon Park
-        (37.78230, -122.39410),  # 15 South Park
-        (37.77660, -122.39100),  # 16 AT&T Park Lot
+        (37.78780, -122.40760),  # 4  Union Square
+        (37.78480, -122.40790),  # 5  Powell St Station
+        (37.80240, -122.40590),  # 6  Coit Tower
+        (37.79480, -122.39880),  # 7  Embarcadero Center
+        (37.77930, -122.41880),  # 8  SF City Hall
+        (37.77680, -122.41650),  # 9  Twitter/X HQ
+        (37.77860, -122.38930),  # 10 Oracle Park
+        (37.80870, -122.40990),  # 11 Pier 39
+        (37.80570, -122.42270),  # 12 Ghirardelli Square
+        (37.80280, -122.44820),  # 13 Palace of Fine Arts
+        (37.80200, -122.41870),  # 14 Lombard Street
+        (37.79050, -122.40570),  # 15 Chinatown Gate
+        (37.77840, -122.38820),  # 16 AT&T Park Lot
         (37.78560, -122.40110),  # 17 SFMOMA
         (37.78510, -122.40270),  # 18 Yerba Buena Gardens
-        (37.78480, -122.40790),  # 19 Powell St Station
+        (37.79080, -122.38850),  # 19 Rincon Park
     ],
 }
 
-# ------------------------------------------------------------------
-# CENTRAL TOKYO
-# 20 locations in Shibuya / Shinjuku / Ginza / Asakusa
-# Typical: 200m to 10km
-# ------------------------------------------------------------------
 TOKYO_CENTRAL = {
     "names": [
         "Shibuya Crossing",          # 0
-        "Shibuya 109",               # 1  ~100m from crossing
-        "Harajuku Station",          # 2  ~1.2km from Shibuya
-        "Meiji Shrine",              # 3  ~1.5km from Shibuya
-        "Shinjuku Station",          # 4  ~3km from Shibuya
-        "Tokyo Tower",               # 5  ~4.5km from Shibuya
-        "Roppongi Hills",            # 6  ~2km from Shibuya
-        "Tokyo Station",             # 7  ~6km from Shibuya
-        "Ginza Crossing",            # 8  ~5.5km from Shibuya
-        "Akihabara",                 # 9  ~7.5km from Shibuya
-        "Ueno Park",                 # 10 ~9km from Shibuya
-        "Asakusa/Sensoji",           # 11 ~10km from Shibuya
-        "Ikebukuro Station",         # 12 ~6km from Shibuya
-        "Ebisu Garden Place",        # 13 ~1km from Shibuya
+        "Shibuya 109",               # 1  ~160m
+        "Harajuku Station",          # 2  ~1.3km
+        "Meiji Shrine",              # 3  ~2km
+        "Shinjuku Station",          # 4  ~3.5km
+        "Tokyo Tower",               # 5  ~5km
+        "Roppongi Hills",            # 6  ~3km
+        "Tokyo Station",             # 7  ~8km
+        "Ginza Crossing",            # 8  ~7km
+        "Akihabara",                 # 9  ~9km
+        "Ueno Park",                 # 10 ~9km
+        "Asakusa/Sensoji",           # 11 ~10km
+        "Ikebukuro Station",         # 12 ~5km
+        "Ebisu Garden Place",        # 13 ~1.5km
         "Yoyogi Park",               # 14 ~1km from Shibuya
-        "Shinagawa Station",         # 15 ~5km from Shibuya
-        "Odaiba",                    # 16 ~8km from Shibuya
-        "Tsukiji Market",            # 17 ~6km from Shibuya
-        "Nihonbashi",                # 18 ~7km from Shibuya
+        "Shinagawa Station",         # 15 ~5km
+        "Odaiba",                    # 16 ~8km
+        "Tsukiji Market",            # 17 ~6km
+        "Nihonbashi",                # 18 ~7km
         "Hachiko Statue",            # 19 ~50m from crossing
     ],
     "locs": [
@@ -428,11 +449,6 @@ TOKYO_CENTRAL = {
     ],
 }
 
-# ------------------------------------------------------------------
-# CENTRAL LONDON
-# 20 locations in Westminster / City / Southbank / Soho
-# Typical: 100m to 5km
-# ------------------------------------------------------------------
 LONDON_CENTRAL = {
     "names": [
         "Big Ben",                   # 0
@@ -480,11 +496,6 @@ LONDON_CENTRAL = {
     ],
 }
 
-# ------------------------------------------------------------------
-# MUMBAI (SOUTH/CENTRAL)
-# 20 locations from Colaba to Bandra
-# Typical: 200m to 10km
-# ------------------------------------------------------------------
 MUMBAI = {
     "names": [
         "Gateway of India",          # 0
@@ -538,229 +549,164 @@ MUMBAI = {
 # ======================================================================
 
 class TestManhattan20Users(unittest.TestCase):
-    """
-    20 users scattered across Manhattan, ~50m to ~5km apart.
-    Tests the system at city-block resolution.
-    """
+    """20 users scattered across Manhattan, ~50m to ~5km apart."""
 
     def test_from_times_square(self):
-        """
-        Target: Times Square (0).
-        Nearest should be Rockefeller (4) or Bryant Park (1), both ~350m.
-        """
         locs = MANHATTAN["locs"]
         names = MANHATTAN["names"]
         verify_nearest(self, 0, locs, names, "Manhattan")
 
     def test_from_wall_street(self):
-        """
-        Target: Wall Street (13).
-        Nearest should be Brooklyn Bridge (14) or One World Trade (15).
-        """
         locs = MANHATTAN["locs"]
         names = MANHATTAN["names"]
         verify_nearest(self, 13, locs, names, "Manhattan")
 
     def test_from_met_museum(self):
-        """
-        Target: Met Museum (17), upper east side.
-        Nearest should be Central Park Zoo (19) ~1.3km.
-        """
         locs = MANHATTAN["locs"]
         names = MANHATTAN["names"]
         verify_nearest(self, 17, locs, names, "Manhattan")
 
     def test_adjacent_penn_msg(self):
-        """
-        Penn Station (8) and Madison Sq Garden (9) are ~11m apart.
-        From Penn Station, the nearest MUST be MSG.
-        """
+        """Penn Station and MSG are ~11m apart."""
         locs = MANHATTAN["locs"]
         names = MANHATTAN["names"]
         dist_m = haversine_m(locs[8], locs[9])
-        print(f"\n  [Manhattan] Penn Station ↔ MSG: {dist_m:.0f}m")
+        print(f"\n  [Manhattan] Penn Station <-> MSG: {dist_m:.0f}m")
         verify_nearest(self, 8, locs, names, "Manhattan-adjacent")
 
     def test_from_washington_sq(self):
-        """
-        Target: Washington Square Park (12), Greenwich Village.
-        Nearest should be Union Square (11) ~750m or High Line (16).
-        """
         locs = MANHATTAN["locs"]
         names = MANHATTAN["names"]
         verify_nearest(self, 12, locs, names, "Manhattan")
 
 
 class TestSFDowntown20Users(unittest.TestCase):
-    """
-    20 users in downtown San Francisco, ~100m to ~3km apart.
-    Very compact financial district + SoMa grid.
-    """
+    """20 users in downtown San Francisco, ~100m to ~3km apart."""
 
     def test_from_salesforce_tower(self):
-        """Salesforce Tower (0) — nearest is likely Embarcadero Ctr (7) or Rincon Park."""
         locs = SF_DOWNTOWN["locs"]
         names = SF_DOWNTOWN["names"]
         verify_nearest(self, 0, locs, names, "SF")
 
     def test_from_sfmoma(self):
-        """SFMOMA (17) — nearest is Yerba Buena (18) ~170m or Moscone (3)."""
         locs = SF_DOWNTOWN["locs"]
         names = SF_DOWNTOWN["names"]
         verify_nearest(self, 17, locs, names, "SF")
 
     def test_from_pier39(self):
-        """Pier 39 (11), touristy north — nearest is Ghirardelli (12) or Coit Tower (6)."""
         locs = SF_DOWNTOWN["locs"]
         names = SF_DOWNTOWN["names"]
         verify_nearest(self, 11, locs, names, "SF")
 
     def test_from_city_hall(self):
-        """SF City Hall (8) — nearest is Twitter/X HQ (9) ~300m."""
         locs = SF_DOWNTOWN["locs"]
         names = SF_DOWNTOWN["names"]
         verify_nearest(self, 8, locs, names, "SF")
 
     def test_from_oracle_park(self):
-        """Oracle Park (10) — nearest is AT&T lot (16) ~200m."""
         locs = SF_DOWNTOWN["locs"]
         names = SF_DOWNTOWN["names"]
         verify_nearest(self, 10, locs, names, "SF")
 
 
 class TestTokyoCentral20Users(unittest.TestCase):
-    """
-    20 users across central Tokyo, ~50m to ~10km apart.
-    Tests extreme density around Shibuya + spread to Asakusa.
-    """
+    """20 users across central Tokyo, ~50m to ~10km apart."""
 
     def test_from_shibuya_crossing(self):
-        """
-        Shibuya Crossing (0) — Hachiko (19) is ~50m away, must win
-        over Shibuya 109 (1) at ~160m.
-        """
         locs = TOKYO_CENTRAL["locs"]
         names = TOKYO_CENTRAL["names"]
         dist_19 = haversine_m(locs[0], locs[19])
         dist_1 = haversine_m(locs[0], locs[1])
-        print(f"\n  [Tokyo] Shibuya Crossing → Hachiko: {dist_19:.0f}m, → 109: {dist_1:.0f}m")
+        print(f"\n  [Tokyo] Shibuya Crossing -> Hachiko: {dist_19:.0f}m, -> 109: {dist_1:.0f}m")
         verify_nearest(self, 0, locs, names, "Tokyo")
 
     def test_from_tokyo_station(self):
-        """Tokyo Station (7) — nearest is Nihonbashi (18) ~700m or Ginza (8)."""
         locs = TOKYO_CENTRAL["locs"]
         names = TOKYO_CENTRAL["names"]
         verify_nearest(self, 7, locs, names, "Tokyo")
 
     def test_from_asakusa(self):
-        """Asakusa/Sensoji (11) — nearest is Ueno Park (10) ~2km."""
         locs = TOKYO_CENTRAL["locs"]
         names = TOKYO_CENTRAL["names"]
         verify_nearest(self, 11, locs, names, "Tokyo")
 
     def test_from_shinjuku(self):
-        """Shinjuku (4) — nearest depends on exact coords. Likely Ikebukuro (12) or Yoyogi (14)."""
         locs = TOKYO_CENTRAL["locs"]
         names = TOKYO_CENTRAL["names"]
         verify_nearest(self, 4, locs, names, "Tokyo")
 
     def test_from_ebisu(self):
-        """Ebisu (13) — nearest is Shibuya Crossing (0) or Roppongi (6)."""
         locs = TOKYO_CENTRAL["locs"]
         names = TOKYO_CENTRAL["names"]
         verify_nearest(self, 13, locs, names, "Tokyo")
 
 
 class TestLondonCentral20Users(unittest.TestCase):
-    """
-    20 users across central London, ~100m to ~4km.
-    Very dense around Westminster / West End.
-    """
+    """20 users across central London, ~100m to ~4km."""
 
     def test_from_big_ben(self):
-        """Big Ben (0) — nearest is Westminster Abbey (1) ~200m or Downing St (3)."""
         locs = LONDON_CENTRAL["locs"]
         names = LONDON_CENTRAL["names"]
         verify_nearest(self, 0, locs, names, "London")
 
     def test_from_tower_bridge(self):
-        """Tower Bridge (11) — nearest is Tower of London (10) ~300m."""
         locs = LONDON_CENTRAL["locs"]
         names = LONDON_CENTRAL["names"]
         verify_nearest(self, 11, locs, names, "London")
 
     def test_from_leicester_sq(self):
-        """Leicester Square (8) — dense West End. Piccadilly (6) ~200m or Covent Garden (7)."""
         locs = LONDON_CENTRAL["locs"]
         names = LONDON_CENTRAL["names"]
         verify_nearest(self, 8, locs, names, "London")
 
     def test_from_kings_cross(self):
-        """King's Cross (17) — northern outlier. Nearest: British Museum (16) ~1.3km."""
         locs = LONDON_CENTRAL["locs"]
         names = LONDON_CENTRAL["names"]
         verify_nearest(self, 17, locs, names, "London")
 
     def test_from_buckingham(self):
-        """Buckingham Palace (5) — nearest: Westminster Abbey (1) or Big Ben (0)."""
         locs = LONDON_CENTRAL["locs"]
         names = LONDON_CENTRAL["names"]
         verify_nearest(self, 5, locs, names, "London")
 
 
 class TestMumbai20Users(unittest.TestCase):
-    """
-    20 users from Colaba to Bandra, ~100m to ~10km.
-    Tests a long, narrow coastal city layout.
-    """
+    """20 users from Colaba to Bandra, ~100m to ~10km."""
 
     def test_from_gateway(self):
-        """Gateway of India (0) — Taj Mahal Palace (1) is ~150m, must win."""
         locs = MUMBAI["locs"]
         names = MUMBAI["names"]
         d = haversine_m(locs[0], locs[1])
-        print(f"\n  [Mumbai] Gateway → Taj: {d:.0f}m")
+        print(f"\n  [Mumbai] Gateway -> Taj: {d:.0f}m")
         verify_nearest(self, 0, locs, names, "Mumbai")
 
     def test_from_cst_station(self):
-        """CST Station (7) — nearest: Crawford Market (8) ~850m or Flora Fountain (18)."""
         locs = MUMBAI["locs"]
         names = MUMBAI["names"]
         verify_nearest(self, 7, locs, names, "Mumbai")
 
     def test_from_bandra(self):
-        """Bandra Station (13) — nearest: Mount Mary (12) ~1.5km or Bandra-Worli (11)."""
         locs = MUMBAI["locs"]
         names = MUMBAI["names"]
         verify_nearest(self, 13, locs, names, "Mumbai")
 
     def test_from_haji_ali(self):
-        """Haji Ali (9) — nearest: Mahalaxmi (10) ~350m."""
         locs = MUMBAI["locs"]
         names = MUMBAI["names"]
         verify_nearest(self, 9, locs, names, "Mumbai")
 
     def test_from_nariman_point(self):
-        """Nariman Point (3) — nearest: Marine Drive (4) or Oval Maidan (19)."""
         locs = MUMBAI["locs"]
         names = MUMBAI["names"]
         verify_nearest(self, 3, locs, names, "Mumbai")
 
 
 class TestSameBlock(unittest.TestCase):
-    """
-    Extreme precision test: multiple users on the same city block
-    (< 50 meters apart). This pushes the limits of CKKS precision
-    on tiny coordinate differences.
-    """
+    """Extreme precision: users < 50m apart."""
 
     def test_times_square_block(self):
-        """
-        5 users within 200m of Times Square.
-        Differences at the 4th-5th decimal place.
-        """
         locs = [
-            (40.75800, -73.98557),  # 0  Times Square center
+            (40.75800, -73.98557),  # 0  TS center
             (40.75825, -73.98540),  # 1  ~30m NE
             (40.75780, -73.98580),  # 2  ~30m SW
             (40.75810, -73.98500),  # 3  ~50m E
@@ -770,17 +716,14 @@ class TestSameBlock(unittest.TestCase):
 
         print("\n  [same-block] Distances from TS center:")
         for i in range(1, 5):
-            print(f"    → {names[i]:10s}: {haversine_m(locs[0], locs[i]):.0f}m")
+            print(f"    -> {names[i]:10s}: {haversine_m(locs[0], locs[i]):.0f}m")
 
         verify_nearest(self, 0, locs, names, "same-block")
 
     def test_shibuya_scramble(self):
-        """
-        5 users around Shibuya Scramble intersection — 10m to 150m.
-        """
         locs = [
             (35.65940, 139.70060),   # 0  Crossing center
-            (35.65935, 139.70055),   # 1  ~7m (next to the crossing)
+            (35.65935, 139.70055),   # 1  ~7m
             (35.65960, 139.70080),   # 2  ~28m NE
             (35.65910, 139.70030),   # 3  ~45m SW
             (35.65900, 139.70040),   # 4  Hachiko ~50m
@@ -789,26 +732,15 @@ class TestSameBlock(unittest.TestCase):
 
         print("\n  [same-block] Distances from Shibuya Scramble:")
         for i in range(1, 5):
-            print(f"    → {names[i]:10s}: {haversine_m(locs[0], locs[i]):.0f}m")
+            print(f"    -> {names[i]:10s}: {haversine_m(locs[0], locs[i]):.0f}m")
 
         verify_nearest(self, 0, locs, names, "same-block-shibuya")
 
 
 class TestDenseClusterWithOutliers(unittest.TestCase):
-    """
-    Dense cluster of users + a few far-away outliers.
-    The outliers should never be chosen as nearest for
-    anyone in the cluster. Tests that small intra-cluster
-    differences aren't overwhelmed by large outlier distances.
-    """
+    """Dense cluster + far away outliers. Outliers should never be nearest."""
 
     def test_manhattan_cluster_plus_boroughs(self):
-        """
-        15 users in Midtown Manhattan (< 2km apart)
-        + 5 users in outer boroughs (5-15km away).
-
-        Every Midtown user's nearest should be another Midtown user.
-        """
         midtown = [
             (40.75800, -73.98557),  # 0  Times Square
             (40.75360, -73.98340),  # 1  Bryant Park
@@ -842,22 +774,15 @@ class TestDenseClusterWithOutliers(unittest.TestCase):
             "Yankee Stadium", "Statue Liberty", "Prospect Pk", "LIC", "Coney Island",
         ]
 
-        # Test from several midtown locations —
-        # nearest should always be in midtown (slots 0-14)
         midtown_slots = set(range(15))
-
         for target in [0, 3, 7, 10]:
             winner = verify_nearest(self, target, locs, names, "cluster")
             self.assertIn(
                 winner, midtown_slots,
-                f"{names[target]}: nearest should be in Midtown, got {names[winner]} (slot {winner})"
+                f"{names[target]}: nearest should be in Midtown, got {names[winner]}"
             )
 
     def test_sf_soma_plus_east_bay(self):
-        """
-        10 SoMa users (< 1km apart) + 5 East Bay users (5-15km away).
-        SoMa users should always match within SoMa.
-        """
         soma = [
             (37.78950, -122.39640),  # 0  Salesforce Tower
             (37.78560, -122.40110),  # 1  SFMOMA
@@ -889,25 +814,17 @@ class TestDenseClusterWithOutliers(unittest.TestCase):
             winner = verify_nearest(self, target, locs, names, "SF-cluster")
             self.assertIn(
                 winner, soma_slots,
-                f"{names[target]}: nearest should be in SoMa, got {names[winner]} (slot {winner})"
+                f"{names[target]}: nearest should be in SoMa, got {names[winner]}"
             )
 
 
 class TestPrecisionDistance(unittest.TestCase):
-    """
-    Verify that the FHE system can distinguish distances that
-    differ by small amounts in dense urban settings.
-    """
+    """Verify FHE distinguishes small distance differences."""
 
     def test_can_distinguish_30m_vs_50m(self):
-        """
-        Target at origin. Two opponents: one 30m away, one 50m away.
-        ~0.0003° and ~0.0005° difference at 40°N.
-        """
         target = (40.75000, -73.98000)
-        close  = (40.75027, -73.98000)  # ~30m north
-        far    = (40.75045, -73.98000)  # ~50m north
-
+        close  = (40.75027, -73.98000)   # ~30m north
+        far    = (40.75045, -73.98000)   # ~50m north
         locs = [target, close, far]
         names = ["Target", "30m N", "50m N"]
 
@@ -920,13 +837,9 @@ class TestPrecisionDistance(unittest.TestCase):
         print(f"  [precision] winner=slot {winner} ({elapsed:.1f}s)  OK")
 
     def test_can_distinguish_100m_vs_200m(self):
-        """
-        100m vs 200m at a different angle.
-        """
-        target = (51.50700, -0.12760)   # Trafalgar area
+        target = (51.50700, -0.12760)
         close  = (51.50790, -0.12760)   # ~100m north
         far    = (51.50880, -0.12760)   # ~200m north
-
         locs = [target, close, far]
         names = ["Target", "100m N", "200m N"]
 
@@ -939,13 +852,9 @@ class TestPrecisionDistance(unittest.TestCase):
         print(f"  [precision] winner=slot {winner} ({elapsed:.1f}s)  OK")
 
     def test_can_distinguish_500m_vs_700m(self):
-        """
-        500m vs 700m — typical urban scenario.
-        """
-        target = (35.65940, 139.70060)    # Shibuya
-        close  = (35.66390, 139.70060)    # ~500m north
-        far    = (35.66570, 139.70060)    # ~700m north
-
+        target = (35.65940, 139.70060)   # Shibuya
+        close  = (35.66390, 139.70060)   # ~500m north
+        far    = (35.66570, 139.70060)   # ~700m north
         locs = [target, close, far]
         names = ["Shibuya", "500m N", "700m N"]
 
@@ -958,18 +867,83 @@ class TestPrecisionDistance(unittest.TestCase):
         print(f"  [precision] winner=slot {winner} ({elapsed:.1f}s)  OK")
 
 
+class TestDenseAllPartyRequired(unittest.TestCase):
+    """SECURITY: Verify ALL parties required even for dense urban scenarios.
+    Uses a Manhattan 5-user scenario to ensure partial decrypt → garbage."""
+
+    def test_manhattan_partial_decrypt_fails(self):
+        """Run Manhattan proximity, then verify partial decrypt gives garbage."""
+        locs = MANHATTAN["locs"][:5]
+        names = MANHATTAN["names"][:5]
+
+        # Run full pipeline
+        winner, full_vals, elapsed = run_scoring(0, locs, names)
+        print(f"  [security] Manhattan full: slot {winner} ({elapsed:.1f}s)")
+
+        # Now recompute the scoring ciphertext
+        init_lat, init_lon = locs[0]
+        nlat = init_lat / MAX_COORD
+        nlon = init_lon / MAX_COORD
+        lat_pt = _cc.MakeCKKSPackedPlaintext([nlat] * BATCH_SIZE)
+        lon_pt = _cc.MakeCKKSPackedPlaintext([nlon] * BATCH_SIZE)
+        enc_lat = _cc.Encrypt(_joint_pk, lat_pt)
+        enc_lon = _cc.Encrypt(_joint_pk, lon_pt)
+
+        opponents = []
+        for i in range(1, 5):
+            dist_ct = compute_distance_local(_cc, enc_lat, enc_lon, locs[i][0], locs[i][1])
+            vec = [0.0] * BATCH_SIZE
+            vec[i] = 1.0
+            id_pt = _cc.MakeCKKSPackedPlaintext(vec)
+            id_ct = _cc.Encrypt(_joint_pk, id_pt)
+            opponents.append((dist_ct, id_ct))
+
+        result_ct = find_nearest_by_scoring(_cc, opponents)
+
+        # Full threshold decrypt works
+        full_result = threshold_decrypt(_cc, _keypairs, result_ct)
+        full_winner = max(range(len(full_result)), key=lambda i: full_result[i])
+
+        # Partial decrypt (missing party 2) → error or garbage
+        try:
+            partial_result = partial_decrypt(_cc, _keypairs, result_ct, [0, 1])
+            error = abs(partial_result[full_winner] - full_result[full_winner])
+            self.assertGreater(error, 0.01,
+                               f"Missing party should give garbage, error={error}")
+            print(f"  [security] Manhattan partial: error={error:.4f} (garbage)  OK")
+        except RuntimeError:
+            print(f"  [security] Manhattan partial: RuntimeError (decode refused)  OK")
+
+    def test_tokyo_single_party_fails(self):
+        """No single party can decrypt Tokyo dense results."""
+        val = 99.0
+        pt = _cc.MakeCKKSPackedPlaintext([val / MAX_COORD] * BATCH_SIZE)
+        ct = _cc.Encrypt(_joint_pk, pt)
+
+        for party_idx in range(NUM_BASE_PARTIES):
+            try:
+                single_vals = partial_decrypt(_cc, _keypairs, ct, [party_idx])
+                error = abs(single_vals[0] - val / MAX_COORD)
+                self.assertGreater(error, 0.01,
+                                   f"Party {party_idx} alone should fail, error={error}")
+            except RuntimeError:
+                pass  # Expected: OpenFHE refuses to decode
+        print(f"  [security] Tokyo: no single party can decrypt  OK")
+
+
 # ==========================================
 # Runner
 # ==========================================
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("FHE Proximity — Dense Urban Area Tests")
+    print("FHE Proximity — Dense Urban Area Tests (Threshold)")
     print("=" * 60)
     print(f"  BATCH_SIZE={BATCH_SIZE}, MAX_USERS={MAX_USERS}")
+    print(f"  Threshold: N-of-N (ALL {NUM_BASE_PARTIES} parties required)")
     print(f"  Pairwise scoring, depth budget 5 levels")
     print()
-    print("5 cities × 20 users each + precision + cluster tests")
+    print("5 cities x 20 users each + precision + cluster + security")
     print("=" * 60 + "\n")
 
     start = time.time()
@@ -977,9 +951,10 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
 
-    # Order: fast (small) → slow (20-user)
+    # Fast tests first
     suite.addTests(loader.loadTestsFromTestCase(TestPrecisionDistance))
     suite.addTests(loader.loadTestsFromTestCase(TestSameBlock))
+    suite.addTests(loader.loadTestsFromTestCase(TestDenseAllPartyRequired))
     suite.addTests(loader.loadTestsFromTestCase(TestDenseClusterWithOutliers))
     suite.addTests(loader.loadTestsFromTestCase(TestManhattan20Users))
     suite.addTests(loader.loadTestsFromTestCase(TestSFDowntown20Users))
