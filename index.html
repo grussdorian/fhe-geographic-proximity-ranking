@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔐 FHE Proximity Protocol — Dresden</title>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        /* ============================================
+           RESET & BASE
+           ============================================ */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            font-family: 'Press Start 2P', monospace;
+            background: #0f0f23;
+            color: #ccccdd;
+            height: 100%; overflow: hidden;
+        }
+        /* CRT scanline overlay */
+        body::after {
+            content: '';
+            position: fixed; top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            background: repeating-linear-gradient(
+                0deg,
+                rgba(0,0,0,0.04) 0px, rgba(0,0,0,0.04) 1px,
+                transparent 1px, transparent 3px
+            );
+            z-index: 99999;
+        }
+
+        /* ============================================
+           LAYOUT
+           ============================================ */
+        #app { display: flex; height: 100vh; }
+        #map-panel { flex: 1; position: relative; background: #0a0a1a; }
+        #side-panel {
+            width: 380px; min-width: 340px;
+            background: #1a1a2e;
+            border-left: 4px solid #e94560;
+            display: flex; flex-direction: column;
+            overflow: hidden;
+            z-index: 600;
+        }
+
+        /* ============================================
+           MAP
+           ============================================ */
+        #map { width: 100%; height: 100%; z-index: 1; }
+        .leaflet-tile {
+            filter: saturate(0.45) contrast(1.1) brightness(0.82);
+        }
+        .leaflet-control-attribution { font-family: monospace !important; font-size: 9px !important; }
+        /* pixel grid over map */
+        #map-grid {
+            position: absolute; top:0; left:0; width:100%; height:100%;
+            pointer-events: none; z-index: 450;
+            background-image:
+                linear-gradient(rgba(60,60,120,0.04) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(60,60,120,0.04) 1px, transparent 1px);
+            background-size: 8px 8px;
+        }
+        #animation-overlay {
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 500; overflow: hidden;
+        }
+
+        /* ============================================
+           MAP MARKERS
+           ============================================ */
+        .map-marker { text-align: center; }
+        .map-marker img {
+            width: 52px; height: 52px;
+            image-rendering: pixelated;
+            filter: drop-shadow(2px 3px 0 rgba(0,0,0,0.7));
+        }
+        .map-marker .marker-label {
+            font-family: 'Press Start 2P', monospace;
+            font-size: 8px;
+            color: #fff;
+            text-shadow: 2px 2px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
+            margin-top: 2px;
+            white-space: nowrap;
+        }
+        .server-marker img { width: 60px; height: 60px; }
+        .server-marker .marker-label { color: #48dbfb; font-size: 7px; }
+        @keyframes dropIn {
+            0%   { transform: translateY(-60px) scale(0.3); opacity: 0; }
+            60%  { transform: translateY(6px) scale(1.05); opacity: 1; }
+            100% { transform: translateY(0) scale(1); opacity: 1; }
+        }
+        .drop-anim img { animation: dropIn 0.45s ease-out; }
+
+        /* ============================================
+           FLYING SPRITES
+           ============================================ */
+        .flying-sprite {
+            position: absolute;
+            width: 36px; height: 36px;
+            image-rendering: pixelated;
+            transform: translate(-50%, -50%);
+            z-index: 1000;
+            filter: drop-shadow(0 0 10px rgba(255,255,100,0.85));
+            pointer-events: none;
+        }
+        @keyframes arcFly1 {
+            0%,100% { transform: translate(-50%,-50%) scale(1) rotate(0deg); }
+            50% { transform: translate(-50%, calc(-50% - 38px)) scale(1.35) rotate(12deg); }
+        }
+        @keyframes arcFly2 {
+            0%,100% { transform: translate(-50%,-50%) scale(1) rotate(0deg); }
+            50% { transform: translate(-50%, calc(-50% - 28px)) scale(1.25) rotate(-10deg); }
+        }
+        @keyframes arcFly3 {
+            0%,100% { transform: translate(-50%,-50%) scale(1); }
+            50% { transform: translate(-50%, calc(-50% - 45px)) scale(1.4); }
+        }
+        .arc1 { animation-name: arcFly1; animation-timing-function: ease-in-out; }
+        .arc2 { animation-name: arcFly2; animation-timing-function: ease-in-out; }
+        .arc3 { animation-name: arcFly3; animation-timing-function: ease-in-out; }
+
+        /* ============================================
+           SIDE PANEL — HEADER
+           ============================================ */
+        #side-header {
+            padding: 16px 14px;
+            text-align: center;
+            border-bottom: 4px solid #e94560;
+            background: linear-gradient(180deg, #16213e 0%, #1a1a2e 100%);
+        }
+        #side-header h1 {
+            font-size: 11px; color: #e94560;
+            line-height: 1.8; letter-spacing: 1px;
+        }
+        #side-header .subtitle {
+            font-size: 6px; color: #48dbfb;
+            margin-top: 6px; letter-spacing: 2px;
+        }
+        .blink { animation: blink 1s step-end infinite; }
+        @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0;} }
+
+        /* ============================================
+           CHARACTER CARDS
+           ============================================ */
+        #characters-section { padding: 10px 12px; }
+        #characters-section .section-label {
+            font-size: 7px; color: #666; margin-bottom: 8px; text-align: center;
+        }
+        #characters {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .char-card {
+            background: #111126;
+            border: 3px solid #2a2a4a;
+            padding: 10px 6px 8px;
+            text-align: center;
+            transition: border-color 0.15s, box-shadow 0.15s;
+            position: relative;
+        }
+        .char-card:hover { border-color: #555; }
+        .char-card.placed {
+            border-color: #00ff88;
+            box-shadow: inset 0 0 12px rgba(0,255,136,0.08);
+        }
+        .char-card.placed::after {
+            content: '✓'; position: absolute; top: 4px; right: 6px;
+            font-size: 8px; color: #00ff88;
+        }
+        .char-card img {
+            width: 48px; height: 48px;
+            image-rendering: pixelated;
+            filter: drop-shadow(1px 2px 0 rgba(0,0,0,0.6));
+        }
+        .char-card .name {
+            font-size: 7px; margin-top: 5px; letter-spacing: 1px;
+        }
+        .char-card .status {
+            font-size: 5px; margin-top: 3px; color: #555;
+        }
+
+        /* ============================================
+           INSTRUCTIONS
+           ============================================ */
+        #instructions {
+            padding: 10px 14px;
+            text-align: center;
+        }
+        #instructions p {
+            font-size: 7px; color: #48dbfb;
+            line-height: 2; letter-spacing: 0.5px;
+        }
+
+        /* ============================================
+           INITIATOR SELECT
+           ============================================ */
+        #initiator-section {
+            padding: 12px 14px;
+            text-align: center;
+            border-top: 3px dashed #ffdd57;
+            display: none;
+            background: rgba(255,221,87,0.03);
+        }
+        #initiator-section h3 {
+            font-size: 8px; color: #ffdd57;
+            margin-bottom: 6px;
+        }
+        #initiator-section .sub {
+            font-size: 6px; color: #999;
+            margin-bottom: 10px; line-height: 1.8;
+        }
+        .init-btn {
+            background: #111126;
+            border: 3px solid #e94560;
+            color: #fff;
+            font-family: 'Press Start 2P', monospace;
+            font-size: 6px;
+            padding: 7px 10px;
+            margin: 4px;
+            cursor: pointer;
+            transition: background 0s;
+        }
+        .init-btn:hover { background: #e94560; }
+        .init-btn img {
+            width: 22px; height: 22px;
+            image-rendering: pixelated;
+            vertical-align: middle;
+            margin-right: 5px;
+        }
+
+        /* ============================================
+           PROTOCOL SECTION
+           ============================================ */
+        #protocol-section {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+            display: none;
+        }
+        /* Progress Bar */
+        #progress-container { margin-bottom: 10px; }
+        #progress-bar-bg {
+            background: #222244;
+            border: 3px solid #444466;
+            height: 18px;
+            position: relative;
+            overflow: hidden;
+        }
+        #progress-bar-fill {
+            background: linear-gradient(90deg, #e94560 0%, #ff6b9d 40%, #ffdd57 80%, #00ff88 100%);
+            height: 100%;
+            width: 0%;
+            transition: width 0.6s ease;
+            position: relative;
+        }
+        /* shimmer */
+        #progress-bar-fill::after {
+            content: '';
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.15) 50%, transparent 100%);
+            animation: shimmer 2s linear infinite;
+        }
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+        #progress-text {
+            font-size: 5px; text-align: center;
+            margin-top: 5px; color: #48dbfb;
+            letter-spacing: 1px;
+        }
+        /* Phase label */
+        .phase-label {
+            font-size: 6px;
+            color: #e94560;
+            letter-spacing: 2px;
+            margin: 10px 0 6px;
+            padding: 4px 8px;
+            border-left: 3px solid #e94560;
+            background: rgba(233,69,96,0.06);
+        }
+        /* Step Cards */
+        .step-card {
+            background: #0d0d1f;
+            border: 2px solid #222244;
+            padding: 9px 10px;
+            margin-bottom: 5px;
+            opacity: 0.35;
+            transition: all 0.35s;
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+        }
+        .step-card.active {
+            border-color: #ffdd57;
+            opacity: 1;
+            box-shadow: 0 0 14px rgba(255,221,87,0.15), inset 0 0 20px rgba(255,221,87,0.03);
+        }
+        .step-card.completed {
+            border-color: #00ff88;
+            opacity: 0.6;
+        }
+        .step-sprite {
+            width: 28px; height: 28px;
+            image-rendering: pixelated;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+        .step-body { flex: 1; }
+        .step-title {
+            font-size: 6px; color: #fff;
+            margin-bottom: 4px; line-height: 1.6;
+        }
+        .step-desc {
+            font-size: 5px; color: #777;
+            line-height: 1.8;
+        }
+        .step-card.active .step-desc { color: #aaa; }
+        .step-card.completed .step-title::before {
+            content: '✅ '; font-size: 7px;
+        }
+
+        /* Scrollbar */
+        #protocol-section::-webkit-scrollbar { width: 5px; }
+        #protocol-section::-webkit-scrollbar-track { background: #0f0f23; }
+        #protocol-section::-webkit-scrollbar-thumb { background: #e94560; }
+
+        /* ============================================
+           RESULT SECTION
+           ============================================ */
+        #result-section {
+            display: none;
+            padding: 16px 14px;
+            text-align: center;
+            border-top: 4px solid #00ff88;
+            background: linear-gradient(180deg, rgba(0,255,136,0.06) 0%, transparent 100%);
+        }
+        #result-section h3 {
+            font-size: 11px; color: #00ff88;
+            margin-bottom: 10px;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%,100% { transform: scale(1); }
+            50% { transform: scale(1.06); }
+        }
+        #result-text {
+            font-size: 6px; color: #ddd; line-height: 2.2;
+        }
+        #reset-btn {
+            margin-top: 14px;
+            background: #e94560;
+            border: 3px solid #ff6b9d;
+            color: #fff;
+            font-family: 'Press Start 2P', monospace;
+            font-size: 8px;
+            padding: 10px 20px;
+            cursor: pointer;
+            letter-spacing: 1px;
+            transition: background 0s;
+        }
+        #reset-btn:hover { background: #ff6b9d; }
+
+        /* ============================================
+           CHARACTER PICKER POPUP
+           ============================================ */
+        #picker-backdrop {
+            display: none;
+            position: fixed; top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 1999;
+        }
+        #char-picker {
+            position: fixed;
+            display: none;
+            background: #1a1a2e;
+            border: 4px solid #e94560;
+            box-shadow: 6px 6px 0 rgba(0,0,0,0.6), 0 0 30px rgba(233,69,96,0.25);
+            padding: 10px;
+            z-index: 2000;
+            min-width: 170px;
+        }
+        #char-picker h4 {
+            font-size: 7px; color: #e94560;
+            margin-bottom: 8px; text-align: center;
+            letter-spacing: 2px;
+        }
+        .picker-btn {
+            display: flex;
+            align-items: center;
+            background: #0f0f23;
+            border: 2px solid #2a2a4a;
+            color: #fff;
+            font-family: 'Press Start 2P', monospace;
+            font-size: 7px;
+            padding: 7px 8px;
+            margin: 4px 0;
+            cursor: pointer;
+            width: 100%;
+            transition: border-color 0s;
+        }
+        .picker-btn:hover {
+            border-color: #48dbfb;
+            background: #16213e;
+        }
+        .picker-btn img {
+            width: 26px; height: 26px;
+            image-rendering: pixelated;
+            margin-right: 8px;
+        }
+        .picker-btn .move-tag {
+            font-size: 5px; color: #ffdd57;
+            margin-left: auto;
+        }
+
+        /* ============================================
+           MATCH LINE SVG
+           ============================================ */
+        .match-line {
+            stroke: #00ff88;
+            stroke-width: 3;
+            stroke-dasharray: 10 5;
+            filter: drop-shadow(0 0 6px rgba(0,255,136,0.6));
+            animation: dashScroll 0.8s linear infinite;
+        }
+        @keyframes dashScroll { to { stroke-dashoffset: -15; } }
+
+        /* ============================================
+           MISC ANIMATIONS
+           ============================================ */
+        @keyframes glow {
+            0%,100% { filter: drop-shadow(0 0 6px rgba(255,255,100,0.4)); }
+            50% { filter: drop-shadow(0 0 18px rgba(255,255,100,1)); }
+        }
+        @keyframes phoneBuzz {
+            0%,100% { transform: translate(-50%,-50%) rotate(0deg); }
+            20% { transform: translate(-50%,-50%) rotate(-8deg); }
+            40% { transform: translate(-50%,-50%) rotate(8deg); }
+            60% { transform: translate(-50%,-50%) rotate(-6deg); }
+            80% { transform: translate(-50%,-50%) rotate(6deg); }
+        }
+        @keyframes bigPulse {
+            0%,100% { transform: translate(-50%,-50%) scale(1); opacity: 0.6; }
+            50% { transform: translate(-50%,-50%) scale(1.8); opacity: 0; }
+        }
+        .server-pulse {
+            position: absolute;
+            width: 80px; height: 80px;
+            border-radius: 50%;
+            border: 3px solid #48dbfb;
+            pointer-events: none;
+            animation: bigPulse 1s ease-out infinite;
+            z-index: 999;
+        }
+        @keyframes heartFloat {
+            0%   { transform: translate(-50%,-50%) scale(0.5); opacity: 0; }
+            30%  { transform: translate(-50%,-80%) scale(1.2); opacity: 1; }
+            100% { transform: translate(-50%,-120%) scale(0.8); opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <!-- ====== MAP PANEL ====== -->
+        <div id="map-panel">
+            <div id="map"></div>
+            <div id="map-grid"></div>
+            <div id="animation-overlay"></div>
+        </div>
+
+        <!-- ====== SIDE PANEL ====== -->
+        <div id="side-panel">
+            <div id="side-header">
+                <h1>🔐 THRESHOLD FHE<br>PROXIMITY DEMO</h1>
+                <div class="subtitle">FULLY HOMOMORPHIC ENCRYPTION · DRESDEN<span class="blink">_</span></div>
+            </div>
+
+            <div id="instructions">
+                <p>📍 DOUBLE-CLICK THE MAP<br>TO PLACE CHARACTERS!</p>
+            </div>
+
+            <div id="characters-section">
+                <div class="section-label">— AGENTS —</div>
+                <div id="characters"></div>
+            </div>
+
+            <div id="initiator-section">
+                <h3>⚔️ ALL AGENTS DEPLOYED!</h3>
+                <div class="sub">Who wants to find their<br>nearest friend?</div>
+                <div id="initiator-buttons"></div>
+            </div>
+
+            <div id="protocol-section">
+                <div id="progress-container">
+                    <div id="progress-bar-bg">
+                        <div id="progress-bar-fill"></div>
+                    </div>
+                    <div id="progress-text">PROTOCOL: INITIALIZING...</div>
+                </div>
+                <div id="steps-container"></div>
+            </div>
+
+            <div id="result-section">
+                <h3>💕 MATCH FOUND 💕</h3>
+                <div id="result-text"></div>
+                <button id="reset-btn" onclick="resetDemo()">↻ PLAY AGAIN</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ====== CHARACTER PICKER ====== -->
+    <div id="picker-backdrop" onclick="closePicker()"></div>
+    <div id="char-picker">
+        <h4>⬇ PLACE WHO?</h4>
+        <div id="picker-buttons"></div>
+    </div>
+
+    <script>
+    // ==============================================================
+    //  CONSTANTS & STATE
+    // ==============================================================
+    const DRESDEN = [51.0504, 13.7373];
+    const CHARS = [
+        { name: 'Alice',   key: 'alice',   color: '#ff6b9d', keys: ['k1','k2'], locks: ['l1','l2'] },
+        { name: 'Bob',     key: 'bob',     color: '#4ecdc4', keys: ['k3','k4'], locks: ['l3','l4'] },
+        { name: 'Charlie', key: 'charlie', color: '#ffe66d', keys: ['k5','k6'], locks: ['l5','l6'] },
+        { name: 'Diana',   key: 'diana',   color: '#a855f7', keys: ['k7','k8'], locks: ['l7','l8'] },
+    ];
+
+    let map, serverMarker;
+    let charMarkers  = {};   // name → Leaflet marker
+    let charPositions = {};  // name → [lat,lng]
+    let pendingLatLng = null;
+    let protocolRunning = false;
+
+    // ==============================================================
+    //  MAP SETUP
+    // ==============================================================
+    function initMap() {
+        map = L.map('map', {
+            center: DRESDEN,
+            zoom: 14,
+            zoomControl: true,
+            doubleClickZoom: false,
+        });
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors',
+            maxZoom: 19,
+        }).addTo(map);
+
+        // Server marker at city center
+        const sIcon = L.divIcon({
+            className: 'map-marker server-marker',
+            html: '<img src="images/server.png"><div class="marker-label">SERVER</div>',
+            iconSize: [60, 78], iconAnchor: [30, 39],
+        });
+        serverMarker = L.marker(DRESDEN, { icon: sIcon, interactive: false, zIndexOffset: 200 }).addTo(map);
+
+        map.on('dblclick', onMapDblClick);
+    }
+
+    // ==============================================================
+    //  CHARACTER CARDS (right panel)
+    // ==============================================================
+    function renderCards() {
+        const c = document.getElementById('characters');
+        c.innerHTML = '';
+        CHARS.forEach(ch => {
+            const placed = !!charPositions[ch.name];
+            const d = document.createElement('div');
+            d.className = 'char-card' + (placed ? ' placed' : '');
+            d.id = 'card-' + ch.name;
+            d.innerHTML = `
+                <img src="images/${ch.key}.png" alt="${ch.name}">
+                <div class="name" style="color:${ch.color}">${ch.name.toUpperCase()}</div>
+                <div class="status">${placed ? 'DEPLOYED' : 'AWAITING ORDERS'}</div>`;
+            c.appendChild(d);
+        });
+    }
+
+    // ==============================================================
+    //  DOUBLE-CLICK → PICKER POPUP
+    // ==============================================================
+    function onMapDblClick(e) {
+        if (protocolRunning) return;
+        pendingLatLng = e.latlng;
+
+        const picker = document.getElementById('char-picker');
+        const btns   = document.getElementById('picker-buttons');
+        const mapR   = document.getElementById('map').getBoundingClientRect();
+
+        let px = e.containerPoint.x + mapR.left;
+        let py = e.containerPoint.y + mapR.top;
+        if (px + 190 > window.innerWidth)  px = window.innerWidth  - 200;
+        if (py + 260 > window.innerHeight) py = window.innerHeight - 270;
+
+        picker.style.left = px + 'px';
+        picker.style.top  = py + 'px';
+
+        btns.innerHTML = '';
+        CHARS.forEach(ch => {
+            const btn = document.createElement('button');
+            btn.className = 'picker-btn';
+            const already = charPositions[ch.name];
+            btn.innerHTML = `<img src="images/${ch.key}.png">${ch.name}` +
+                (already ? '<span class="move-tag">MOVE</span>' : '');
+            btn.onclick = () => placeCharacter(ch.name, pendingLatLng);
+            btns.appendChild(btn);
+        });
+
+        document.getElementById('picker-backdrop').style.display = 'block';
+        picker.style.display = 'block';
+    }
+
+    function closePicker() {
+        document.getElementById('picker-backdrop').style.display = 'none';
+        document.getElementById('char-picker').style.display     = 'none';
+    }
+
+    // ==============================================================
+    //  PLACE / MOVE CHARACTER
+    // ==============================================================
+    function placeCharacter(name, latlng) {
+        closePicker();
+        const ch = CHARS.find(c => c.name === name);
+
+        if (charMarkers[name]) map.removeLayer(charMarkers[name]);
+
+        const icon = L.divIcon({
+            className: 'map-marker drop-anim',
+            html: `<img src="images/${ch.key}.png"><div class="marker-label" style="color:${ch.color}">${name.toUpperCase()}</div>`,
+            iconSize: [52, 68], iconAnchor: [26, 34],
+        });
+        const marker = L.marker(latlng, { icon, draggable: true, zIndexOffset: 100 }).addTo(map);
+        marker.on('dragend', () => {
+            charPositions[name] = [marker.getLatLng().lat, marker.getLatLng().lng];
+            renderCards();
+            checkAllPlaced();
+        });
+        charMarkers[name]   = marker;
+        charPositions[name]  = [latlng.lat, latlng.lng];
+
+        renderCards();
+        checkAllPlaced();
+    }
+
+    // ==============================================================
+    //  ALL PLACED? → SHOW INITIATOR SELECT
+    // ==============================================================
+    function checkAllPlaced() {
+        const allPlaced = CHARS.every(ch => charPositions[ch.name]);
+        const sec   = document.getElementById('initiator-section');
+        const instr = document.getElementById('instructions');
+
+        if (allPlaced) {
+            sec.style.display = 'block';
+            instr.style.display = 'none';
+            renderInitBtns();
+        } else {
+            sec.style.display = 'none';
+            const rem = CHARS.filter(ch => !charPositions[ch.name]).length;
+            instr.innerHTML = `<p>📍 DOUBLE-CLICK THE MAP<br>TO PLACE CHARACTERS!<br><span style="color:#ffdd57">${rem} remaining...</span></p>`;
+            instr.style.display = 'block';
+        }
+    }
+
+    function renderInitBtns() {
+        const c = document.getElementById('initiator-buttons');
+        c.innerHTML = '';
+        CHARS.forEach(ch => {
+            const b = document.createElement('button');
+            b.className = 'init-btn';
+            b.innerHTML = `<img src="images/${ch.key}.png">${ch.name}`;
+            b.onclick = () => startProtocol(ch.name);
+            c.appendChild(b);
+        });
+    }
+
+    // ==============================================================
+    //  PROTOCOL STEP DEFINITIONS
+    // ==============================================================
+    const STEPS = [
+        /* 0 */ {
+            phase: '🔑 KEY GENERATION',
+            title: 'Forging Secret Keys',
+            desc:  'Each agent crafts their own secret key piece. Like puzzle pieces\u2014nobody has the full picture!',
+            sprite: 'k1', progress: 8,
+        },
+        /* 1 */ {
+            phase: '🔑 KEY GENERATION',
+            title: 'Sending Key Shares',
+            desc:  'Public key shares fly to the server. The server collects them, but can\'t assemble the lock alone!',
+            sprite: 'l1', progress: 16,
+        },
+        /* 2 */ {
+            phase: '🔑 KEY GENERATION',
+            title: 'Forging the Super Lock\u2122',
+            desc:  'Server combines all pieces into one mega-lock. It takes EVERYONE\'s key to ever open it!',
+            sprite: 'lock-key', progress: 25,
+        },
+        /* 3 */ {
+            phase: '🔑 KEY GENERATION',
+            title: 'Round 2: Extra Key Sauce',
+            desc:  'Special key material so the server can do math on locked (encrypted) data. Pure magic!',
+            sprite: 'k2', progress: 33,
+        },
+        /* 4 */ {
+            phase: '🔒 ENCRYPTED MATCH',
+            title: 'Encrypting Location',
+            desc:  '', // dynamic
+            sprite: 'l2', progress: 42,
+        },
+        /* 5 */ {
+            phase: '🔒 ENCRYPTED MATCH',
+            title: 'Distributing Encrypted Coords',
+            desc:  'Everyone receives the locked location, but nobody can peek inside!',
+            sprite: 'l3', progress: 50,
+        },
+        /* 6 */ {
+            phase: '🔒 ENCRYPTED MATCH',
+            title: 'Private Distance Computation',
+            desc:  'Each phone calculates distance locally. Your real location NEVER leaves your device!',
+            sprite: 'phone', progress: 58,
+        },
+        /* 7 */ {
+            phase: '🔒 ENCRYPTED MATCH',
+            title: 'Encrypted Distances → Server',
+            desc:  'Server gets scrambled numbers. It has zero clue who is where!',
+            sprite: 'l5', progress: 67,
+        },
+        /* 8 */ {
+            phase: '🔒 ENCRYPTED MATCH',
+            title: 'Blindfolded Comparison',
+            desc:  'Server finds the closest match\u2026 with a blindfold on! \uD83D\uDE48 Math on encrypted data!',
+            sprite: 'server', progress: 75,
+        },
+        /* 9 */ {
+            phase: '🔓 THRESHOLD DECRYPTION',
+            title: 'Everyone Sends Their Key',
+            desc:  'ALL key pieces needed to unlock the answer. No shortcuts, no cheating!',
+            sprite: 'k3', progress: 83,
+        },
+        /* 10 */ {
+            phase: '🔓 THRESHOLD DECRYPTION',
+            title: 'Unlocking the Answer',
+            desc:  'Server fuses every key piece together\u2026 the lock clicks open!',
+            sprite: 'lock-key', progress: 92,
+        },
+        /* 11 */ {
+            phase: '💕 RESULT',
+            title: 'Match Revealed!',
+            desc:  '', // dynamic
+            sprite: 'phone-vibrate', progress: 100,
+        },
+    ];
+
+    // Render step cards in side panel
+    function renderSteps() {
+        const c = document.getElementById('steps-container');
+        c.innerHTML = '';
+        let lastPhase = '';
+        STEPS.forEach((s, i) => {
+            if (s.phase !== lastPhase) {
+                lastPhase = s.phase;
+                const ph = document.createElement('div');
+                ph.className = 'phase-label';
+                ph.textContent = s.phase;
+                c.appendChild(ph);
+            }
+            const d = document.createElement('div');
+            d.className = 'step-card';
+            d.id = 'step-' + i;
+            const spriteSrc = s.sprite.includes('/') ? s.sprite : `images/${s.sprite}.png`;
+            d.innerHTML = `
+                <img class="step-sprite" src="${spriteSrc}" alt="">
+                <div class="step-body">
+                    <div class="step-title">${s.title}</div>
+                    <div class="step-desc">${s.desc}</div>
+                </div>`;
+            c.appendChild(d);
+        });
+    }
+
+    // ==============================================================
+    //  PROTOCOL RUNNER
+    // ==============================================================
+    async function startProtocol(initiatorName) {
+        protocolRunning = true;
+        // Lock UI
+        document.getElementById('initiator-section').style.display = 'none';
+        document.getElementById('instructions').style.display      = 'none';
+        document.getElementById('protocol-section').style.display   = 'block';
+        Object.values(charMarkers).forEach(m => { if (m.dragging) m.dragging.disable(); });
+        map.dragging.disable();
+        map.scrollWheelZoom.disable();
+        map.touchZoom.disable();
+
+        // Dynamic desc
+        STEPS[4].desc = `${initiatorName} locks their location with the Super Lock\u2122. Turned into unreadable gibberish!`;
+
+        renderSteps();
+
+        // Precompute pixel positions
+        const pos = {};
+        CHARS.forEach(ch => {
+            pos[ch.name] = map.latLngToContainerPoint(L.latLng(charPositions[ch.name]));
+        });
+        const srvPos = map.latLngToContainerPoint(L.latLng(DRESDEN));
+
+        // Determine nearest
+        const initLL    = charPositions[initiatorName];
+        const others    = CHARS.filter(ch => ch.name !== initiatorName);
+        const initiator = CHARS.find(ch => ch.name === initiatorName);
+        const dists     = {};
+        let nearest = null, minD = Infinity;
+        others.forEach(ch => {
+            const d = haversine(initLL[0], initLL[1],
+                                charPositions[ch.name][0], charPositions[ch.name][1]);
+            dists[ch.name] = d;
+            if (d < minD) { minD = d; nearest = ch.name; }
+        });
+
+        // --------  Phase 1: Key Generation  --------
+
+        // Step 0 — Forge secret keys
+        await activateStep(0);
+        for (const ch of CHARS) {
+            showSpriteAtPos(`images/${ch.keys[0]}.png`, pos[ch.name], 900, ch.color);
+            await delay(350);
+        }
+        await delay(800);
+        await completeStep(0);
+
+        // Step 1 — Key shares fly to server
+        await activateStep(1);
+        await delay(400);
+        await flyMultiple(CHARS.map(ch => ({
+            src: `images/${ch.locks[0]}.png`, from: pos[ch.name], to: srvPos, dur: 1600,
+        })));
+        await delay(300);
+        await completeStep(1);
+
+        // Step 2 — Super Lock forged
+        await activateStep(2);
+        await delay(300);
+        await serverPulse(2200, srvPos);
+        showSpriteAtPos('images/super-key.png', srvPos, 1800, '#48dbfb');
+        await delay(1800);
+        await completeStep(2);
+
+        // Step 3 — Round 2 keys
+        await activateStep(3);
+        await delay(400);
+        await flyMultiple(CHARS.map(ch => ({
+            src: `images/${ch.keys[1]}.png`, from: pos[ch.name], to: srvPos, dur: 1600,
+        })));
+        await delay(300);
+        await completeStep(3);
+
+        // --------  Phase 2: Encrypted Match  --------
+
+        // Step 4 — Initiator encrypts
+        await activateStep(4);
+        await delay(400);
+        showSpriteAtPos(`images/${initiator.locks[0]}.png`, pos[initiatorName], 2200, initiator.color);
+        await delay(2200);
+        await completeStep(4);
+
+        // Step 5 — Distribute encrypted coords
+        await activateStep(5);
+        await delay(300);
+        await flySingle(`images/${initiator.locks[0]}.png`, pos[initiatorName], srvPos, 1200);
+        await delay(200);
+        await flyMultiple(others.map(ch => ({
+            src: `images/${initiator.locks[1]}.png`, from: srvPos, to: pos[ch.name], dur: 1200,
+        })));
+        await delay(300);
+        await completeStep(5);
+
+        // Step 6 — Phones compute distance
+        await activateStep(6);
+        await delay(300);
+        await showPhoneComputation(others, pos);
+        await completeStep(6);
+
+        // Step 7 — Encrypted distances
+        await activateStep(7);
+        await delay(300);
+        await flyMultiple(others.map(ch => ({
+            src: `images/${ch.locks[1]}.png`, from: pos[ch.name], to: srvPos, dur: 1500,
+        })));
+        await delay(300);
+        await completeStep(7);
+
+        // Step 8 — Blind comparison
+        await activateStep(8);
+        await delay(300);
+        await serverPulse(2800, srvPos);
+        await delay(600);
+        await completeStep(8);
+
+        // --------  Phase 3: Threshold Decryption  --------
+
+        // Step 9 — Everyone sends key piece
+        await activateStep(9);
+        await delay(400);
+        await flyMultiple(CHARS.map(ch => ({
+            src: `images/${ch.keys[0]}.png`, from: pos[ch.name], to: srvPos, dur: 1500,
+        })));
+        await delay(400);
+        await completeStep(9);
+
+        // Step 10 — Unlock
+        await activateStep(10);
+        await delay(300);
+        await serverPulse(1800, srvPos);
+        showSpriteAtPos('images/lock-key.png', srvPos, 1800, '#00ff88');
+        await delay(1800);
+        await completeStep(10);
+
+        // Step 11 — MATCH!
+        const nearestCh = CHARS.find(c => c.name === nearest);
+        STEPS[11].desc = `${nearest} is the closest to ${initiatorName}! (${minD.toFixed(2)} km)`;
+        document.querySelector('#step-11 .step-desc').textContent = STEPS[11].desc;
+        await activateStep(11);
+        await delay(400);
+        await showMatchAnimation(initiatorName, nearest, pos);
+        await completeStep(11);
+
+        showResult(initiatorName, nearest, minD, dists);
+    }
+
+    // ==============================================================
+    //  STEP HELPERS
+    // ==============================================================
+    function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    async function activateStep(i) {
+        const card = document.getElementById('step-' + i);
+        card.classList.add('active');
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        document.getElementById('progress-bar-fill').style.width = STEPS[i].progress + '%';
+        document.getElementById('progress-text').textContent =
+            STEPS[i].phase.replace(/[^\w\s]/g,'').trim() + ' — ' + STEPS[i].title;
+        await delay(500);
+    }
+
+    async function completeStep(i) {
+        const card = document.getElementById('step-' + i);
+        card.classList.remove('active');
+        card.classList.add('completed');
+        await delay(350);
+    }
+
+    // ==============================================================
+    //  ANIMATION PRIMITIVES
+    // ==============================================================
+    const overlay = () => document.getElementById('animation-overlay');
+    const arcClasses = ['arc1','arc2','arc3'];
+    let arcIdx = 0;
+
+    function flySingle(src, from, to, dur = 1500) {
+        return new Promise(resolve => {
+            const img = document.createElement('img');
+            img.src = src;
+            img.className = 'flying-sprite ' + arcClasses[arcIdx++ % 3];
+            img.style.left = from.x + 'px';
+            img.style.top  = from.y + 'px';
+            img.style.transition = `left ${dur}ms ease-in-out, top ${dur}ms ease-in-out`;
+            img.style.animationDuration = dur + 'ms';
+            overlay().appendChild(img);
+            void img.offsetHeight;           // reflow
+            img.style.left = to.x + 'px';
+            img.style.top  = to.y + 'px';
+            setTimeout(() => { img.remove(); resolve(); }, dur + 80);
+        });
+    }
+
+    async function flyMultiple(flights) {
+        await Promise.all(flights.map(f => flySingle(f.src, f.from, f.to, f.dur || 1500)));
+    }
+
+    function showSpriteAtPos(src, pos, dur, glowColor) {
+        const img = document.createElement('img');
+        img.src = src;
+        img.className = 'flying-sprite';
+        img.style.left = pos.x + 'px';
+        img.style.top  = (pos.y - 34) + 'px';
+        img.style.animation = `pulse ${Math.min(dur, 800)}ms ease-in-out infinite`;
+        if (glowColor) img.style.filter = `drop-shadow(0 0 12px ${glowColor})`;
+        overlay().appendChild(img);
+        setTimeout(() => img.remove(), dur);
+    }
+
+    function serverPulse(dur, pos) {
+        return new Promise(resolve => {
+            const rings = 3;
+            for (let i = 0; i < rings; i++) {
+                setTimeout(() => {
+                    const ring = document.createElement('div');
+                    ring.className = 'server-pulse';
+                    ring.style.left = pos.x + 'px';
+                    ring.style.top  = pos.y + 'px';
+                    overlay().appendChild(ring);
+                    setTimeout(() => ring.remove(), 1200);
+                }, i * 400);
+            }
+            setTimeout(resolve, dur);
+        });
+    }
+
+    async function showPhoneComputation(others, pos) {
+        const phones = [];
+        for (const ch of others) {
+            const p = pos[ch.name];
+            const img = document.createElement('img');
+            img.src = 'images/phone.png';
+            img.className = 'flying-sprite';
+            img.style.left = (p.x + 28) + 'px';
+            img.style.top  = (p.y - 22) + 'px';
+            img.style.width = '32px'; img.style.height = '32px';
+            img.style.animation = 'phoneBuzz 0.35s ease-in-out infinite';
+            img.style.filter = `drop-shadow(0 0 8px ${ch.color})`;
+            overlay().appendChild(img);
+            phones.push(img);
+        }
+        await delay(2800);
+        phones.forEach(p => p.remove());
+    }
+
+    async function showMatchAnimation(initName, nearName, pos) {
+        const ov = overlay();
+        const iP = pos[initName];
+        const nP = pos[nearName];
+
+        // Vibrating phones
+        [iP, nP].forEach(p => {
+            const img = document.createElement('img');
+            img.src = 'images/phone-vibrate.png';
+            img.className = 'flying-sprite';
+            img.style.left = (p.x + 28) + 'px';
+            img.style.top  = (p.y - 24) + 'px';
+            img.style.width = '42px'; img.style.height = '42px';
+            img.style.animation = 'phoneBuzz 0.3s ease-in-out infinite';
+            img.style.filter = 'drop-shadow(0 0 14px rgba(255,100,150,0.9))';
+            ov.appendChild(img);
+        });
+
+        // Dashed line
+        const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+        svg.setAttribute('style','position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:998;');
+        const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+        line.setAttribute('x1', iP.x); line.setAttribute('y1', iP.y);
+        line.setAttribute('x2', nP.x); line.setAttribute('y2', nP.y);
+        line.setAttribute('class','match-line');
+        svg.appendChild(line);
+        ov.appendChild(svg);
+
+        // Floating hearts
+        const heartPositions = [
+            { x: (iP.x + nP.x) / 2, y: (iP.y + nP.y) / 2 },
+            { x: iP.x + 20, y: iP.y - 10 },
+            { x: nP.x + 20, y: nP.y - 10 },
+        ];
+        for (let i = 0; i < heartPositions.length; i++) {
+            setTimeout(() => {
+                const heart = document.createElement('div');
+                heart.style.cssText = `
+                    position:absolute; z-index:1001; pointer-events:none;
+                    left:${heartPositions[i].x}px; top:${heartPositions[i].y}px;
+                    font-size:24px;
+                    animation: heartFloat 1.6s ease-out forwards;
+                `;
+                heart.textContent = '💕';
+                ov.appendChild(heart);
+                setTimeout(() => heart.remove(), 1700);
+            }, i * 500);
+        }
+
+        await delay(3500);
+    }
+
+    // ==============================================================
+    //  RESULT
+    // ==============================================================
+    function showResult(initName, nearName, dist, allDists) {
+        document.getElementById('result-section').style.display = 'block';
+        const sorted = Object.entries(allDists).sort((a,b) => a[1] - b[1]);
+        let html = `<div style="color:#ffdd57;margin-bottom:10px;font-size:8px;line-height:2">
+            ${nearName} is nearest to ${initName}!</div>`;
+        html += '<div style="margin-top:6px;font-size:6px;line-height:2.4">';
+        sorted.forEach(([name,d]) => {
+            const win = name === nearName;
+            html += `<div style="color:${win ? '#00ff88' : '#888'}">
+                ${win ? '💕' : '·'} ${name}: ${d.toFixed(2)} km ${win ? '💕' : ''}</div>`;
+        });
+        html += '</div>';
+        html += `<div style="margin-top:14px;font-size:5px;color:#666;line-height:2">
+            🔐 Nobody's real location was ever revealed.<br>
+            Not even the server knows where anyone is!<br>
+            Decryption required ALL four key pieces.</div>`;
+        document.getElementById('result-text').innerHTML = html;
+    }
+
+    // ==============================================================
+    //  RESET
+    // ==============================================================
+    function resetDemo() {
+        Object.values(charMarkers).forEach(m => map.removeLayer(m));
+        charMarkers = {}; charPositions = {};
+        protocolRunning = false;
+        overlay().innerHTML = '';
+
+        document.getElementById('protocol-section').style.display  = 'none';
+        document.getElementById('result-section').style.display    = 'none';
+        document.getElementById('initiator-section').style.display = 'none';
+        document.getElementById('progress-bar-fill').style.width   = '0%';
+        document.getElementById('progress-text').textContent       = 'PROTOCOL: STANDBY';
+
+        document.getElementById('instructions').style.display = 'block';
+        document.getElementById('instructions').innerHTML =
+            '<p>📍 DOUBLE-CLICK THE MAP<br>TO PLACE CHARACTERS!</p>';
+
+        map.dragging.enable();
+        map.scrollWheelZoom.enable();
+        map.touchZoom.enable();
+        map.setView(DRESDEN, 14);
+
+        renderCards();
+    }
+
+    // ==============================================================
+    //  UTILITY
+    // ==============================================================
+    function haversine(lat1, lon1, lat2, lon2) {
+        const R = 6371, toRad = n => n * Math.PI / 180;
+        const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+        const a = Math.sin(dLat/2)**2 +
+                  Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    // ==============================================================
+    //  BOOT
+    // ==============================================================
+    initMap();
+    renderCards();
+    </script>
+</body>
+</html>
