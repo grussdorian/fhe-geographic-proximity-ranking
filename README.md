@@ -123,6 +123,8 @@ $$s(x) = 0.5 + x \cdot (0.1125 - 0.00084375 \cdot x^2)$$
 
 This smooth polynomial maps distance differences to scores without branching — which is impossible on encrypted data.
 
+Coordinates are normalised by `MAX_COORD = 0.5` (≈ 55 km at the equator) instead of 180, amplifying within-city squared-distance differences by **129 600×**. The polynomial is monotonically above 0.5 for positive inputs up to $x \approx 11.55$, which covers cities up to ~100 km in diameter. Combined with 4-digit nonces (max 9 999 — keeping CKKS noise low through the `score × ID` multiplication), this gives reliable sub-km resolution for dense urban scenarios.
+
 ---
 
 ## Files
@@ -133,9 +135,9 @@ This smooth polynomial maps distance differences to scores without branching —
 | `server.py` | HTTP server implementing the full threshold FHE protocol. 12 endpoints covering key generation, matching, scoring, and decryption. Holds no secret keys. |
 | `client.py` | Two-role client (`--lead` / `--join`). Handles key share generation, local distance computation, and partial decryption. |
 | `demo.py` | Self-contained orchestrator that runs the entire protocol in one process. Useful for testing and demonstration without HTTP. |
-| `test_fhe_proximity.py` | 33 tests covering encryption roundtrips, local distance computation, proximity matching (2–20 parties), edge cases, symmetry, and N-of-N threshold enforcement. |
-| `test_dense_urban.py` | 34 tests across 5 dense urban environments (Manhattan, SF, Tokyo, London, Mumbai) with 20 users each, plus same-block precision, cluster detection, and threshold security tests. |
-| `test_e2e_client_server.py` | 15 end-to-end scenarios testing the full HTTP client–server protocol. Covers cities worldwide (Bay Area, Manhattan, London, Tokyo, Sydney, Paris, Mumbai, etc.), campus-scale, cross-country, ride-share, hospital, food delivery, and polar edge cases. Auto-manages server lifecycle per test. |
+| `test_fhe_proximity.py` | 38 tests covering encryption roundtrips, local distance computation, proximity matching (2–20 parties), nonce commitment/extraction, shared key derivation, edge cases, symmetry, and N-of-N threshold enforcement. |
+| `test_dense_urban.py` | 34 tests across 5 dense urban environments (Manhattan, SF, Tokyo, London, Mumbai) with 20 users each, plus same-block precision (7m–50m), cluster detection, and threshold security tests. |
+| `test_e2e_client_server.py` | 11 end-to-end scenarios testing the full HTTP client–server protocol with nonce-commitment, match proof, and E2E encrypted chat. Covers cities worldwide (Bay Area, Manhattan, London, Tokyo, Sydney, Paris, Mumbai, LA, SF) at distances from 200m to 67km. Auto-manages server lifecycle per test. |
 | `test_logger.py` | Custom test runner with failure logging. |
 
 ---
