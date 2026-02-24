@@ -1,5 +1,13 @@
 # Private Proximity Matching with Threshold Fully Homomorphic Encryption
 
+## Web demo
+
+```bash
+python web_server.py
+```
+
+Then open `localhost:5000`
+
 ## Manifesto
 
 **The problem is simple: you want to find who's nearby. The cost should not be your privacy.**
