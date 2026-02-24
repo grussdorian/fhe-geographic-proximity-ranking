@@ -16,7 +16,7 @@ Run:
   PYTHONPATH="..." python3.13 test_e2e_client_server.py
 """
 
-import sys, os, time, signal, subprocess, math, requests
+import sys, os, time, signal, subprocess, math, requests, secrets
 
 sys.path.insert(0, ".")
 import client as C
@@ -90,7 +90,8 @@ def stop_server(proc):
 
 def run_scenario(n_parties, locations, names, expected_nearest_name, description):
     """
-    Run a full threshold FHE proximity match scenario.
+    Run a full threshold FHE proximity match scenario with nonce-commitment
+    scheme, local fusion, local slot resolution, and match proof verification.
 
     Args:
         n_parties:   Number of parties (first is the initiator/lead)
@@ -100,7 +101,8 @@ def run_scenario(n_parties, locations, names, expected_nearest_name, description
         description: Human-readable scenario description
 
     Returns:
-        (passed: bool, actual_winner: str, score_vector: list, active_slots: list)
+        (passed: bool, actual_winner: str, score_vector: list, active_slots: list,
+         nonce_verified: bool, proof_verified: bool, chat_ok: bool)
     """
     assert len(locations) == n_parties == len(names)
 
@@ -138,11 +140,13 @@ def run_scenario(n_parties, locations, names, expected_nearest_name, description
     C.fetch_and_install_eval_mult_key()
     joint_pk = keypairs[-1].publicKey
 
-    # ====== Phase 2: Proximity match ======
+    # ====== Phase 2: Proximity match with nonce-commitment ======
     # Initiator starts match
-    C.start_match(party_ids[0], locations[0][0], locations[0][1], joint_pk)
+    match_resp = C.start_match(party_ids[0], locations[0][0], locations[0][1], joint_pk)
+    session_id = match_resp.get("session_id", "unknown")
 
-    # Other parties compute & submit distances
+    # Other parties generate nonces, compute distances, submit with commitments
+    party_nonces = {}   # party_index -> (nonce_val, commitment)
     for i in range(1, n_parties):
         resp = requests.post(f"{SERVER_URL}/get_match", json={"party_id": party_ids[i]})
         match_data = resp.json()
@@ -150,13 +154,17 @@ def run_scenario(n_parties, locations, names, expected_nearest_name, description
         enc_lat = C.deserialize_ciphertext(match_data["enc_lat"])
         enc_lon = C.deserialize_ciphertext(match_data["enc_lon"])
 
+        # Generate nonce + commitment
+        nonce_val, commitment = C.generate_nonce()
+        party_nonces[i] = (nonce_val, commitment)
+
         dist_ct = C.compute_distance_local(
             enc_lat, enc_lon,
             locations[i][0], locations[i][1],
             joint_pk,
         )
-        id_ct = C.encrypt_onehot_id(slots[i], joint_pk)
-        C.submit_distance(party_ids[i], dist_ct, id_ct)
+        id_ct = C.encrypt_onehot_id(slots[i], joint_pk, nonce_val=nonce_val)
+        C.submit_distance(party_ids[i], dist_ct, id_ct, commitment=commitment)
 
     # Server computes pairwise scoring
     resp = requests.post(f"{SERVER_URL}/compute_nearest", json={})
@@ -166,16 +174,85 @@ def run_scenario(n_parties, locations, names, expected_nearest_name, description
     for i in range(n_parties):
         C.do_partial_decrypt(party_ids[i], keypairs[i], is_lead=(i == 0))
 
-    # Fuse & resolve
-    values = C.get_decrypted_result(party_ids[0])
+    # ====== Initiator: local fusion (server never sees plaintext) ======
+    partials, srv_session_id = C.fetch_raw_partials(party_ids[0])
+    values = C.fuse_locally(partials)
+
     initiator_slot = slots[0]
     active = [s for s in range(n_parties) if s != initiator_slot]
 
     winner_slot = max(active, key=lambda s: values[s])
-    winner_name = C.resolve_slot(winner_slot)
+
+    # ====== Local slot resolution (no /resolve — no leakage) ======
+    slot_map = C.fetch_slot_map()
+    winner_name = slot_map.get(winner_slot, f"unknown_slot_{winner_slot}")
+
+    # ====== Nonce extraction + commitment verification ======
+    slot_commitments = C.fetch_commitments()
+    winner_commitment = slot_commitments.get(str(winner_slot))
+
+    nonce_verified = False
+    winner_nonce = None
+    if winner_commitment:
+        winner_nonce, nonce_verified = C.extract_nonce_from_result(
+            values, winner_slot, winner_commitment
+        )
+
+    # ====== Match proof flow ======
+    proof_verified = False
+    chat_ok = False
+    if nonce_verified and winner_nonce is not None:
+        # Initiator submits proof
+        r_initiator = secrets.token_hex(16)
+        C.submit_match_proof(party_ids[0], winner_slot, winner_nonce, r_initiator)
+
+        # Find which party index is the winner
+        winner_party_idx = None
+        for i in range(1, n_parties):
+            if slots[i] == winner_slot:
+                winner_party_idx = i
+                break
+
+        if winner_party_idx is not None:
+            # Winner retrieves proof
+            proof = C.get_match_proof(party_ids[winner_party_idx])
+            if proof is not None:
+                revealed_nonce = proof["revealed_nonce"]
+                original_nonce = party_nonces[winner_party_idx][0]
+                proof_verified = (revealed_nonce == original_nonce)
+
+                # Both sides derive shared key — must match
+                key_initiator = C.derive_shared_key(winner_nonce, r_initiator, srv_session_id)
+                key_winner = C.derive_shared_key(original_nonce, proof["r_initiator"], proof["session_id"])
+                keys_match = (key_initiator == key_winner)
+                proof_verified = proof_verified and keys_match
+
+                # ====== E2E chat verification ======
+                if keys_match:
+                    # Test local encrypt/decrypt round-trip
+                    test_msg = "Hello from initiator!"
+                    encrypted = C.encrypt_message(key_initiator, test_msg)
+                    decrypted = C.decrypt_message(key_winner, encrypted)
+                    chat_ok = (decrypted == test_msg)
+
+                    # Test reverse direction
+                    test_msg2 = "Hello from winner!"
+                    encrypted2 = C.encrypt_message(key_winner, test_msg2)
+                    decrypted2 = C.decrypt_message(key_initiator, encrypted2)
+                    chat_ok = chat_ok and (decrypted2 == test_msg2)
+
+                    # Test server relay: send encrypted message and retrieve it
+                    C.send_chat_message(party_ids[0], key_initiator, "relay test from initiator")
+                    msgs = C.get_chat_messages(party_ids[winner_party_idx], since=0)
+                    relay_msgs = msgs.get("messages", [])
+                    if relay_msgs:
+                        relayed = C.decrypt_message(key_winner, relay_msgs[0]["payload"])
+                        chat_ok = chat_ok and (relayed == "relay test from initiator")
+                    else:
+                        chat_ok = False
 
     passed = (winner_name == expected_nearest_name)
-    return passed, winner_name, values, active
+    return passed, winner_name, values, active, nonce_verified, proof_verified, chat_ok
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -290,24 +367,10 @@ scenario(
     "Charlie at Hoover Tower (~490m).",
 )
 
-# -----------------------------------------------------------
-# 6. Cross-country road trip — very spread out (hundreds of km)
-# -----------------------------------------------------------
-scenario(
-    "Cross-country road trip",
-    3,
-    [
-        (39.7392, -104.9903),   # Alice: Denver
-        (38.6270, -90.1994),    # Bob: St Louis (~1300km)
-        (41.8781, -87.6298),    # Charlie: Chicago (~1500km)
-    ],
-    ["Alice", "Bob", "Charlie"],
-    "Bob",
-    "Long-distance: Denver to St. Louis is closer than Denver to Chicago.",
-)
+# (Cross-country road trip removed — exceeds city-scale MAX_COORD=0.5)
 
 # -----------------------------------------------------------
-# 7. Sydney harbour walk — Southern hemisphere
+# 6. Sydney harbour walk — Southern hemisphere
 # -----------------------------------------------------------
 scenario(
     "Sydney harbour walk",
@@ -357,44 +420,11 @@ scenario(
     "Mumbai: Dave at Fort area is closest to CST.",
 )
 
-# -----------------------------------------------------------
-# 10. Arctic edge case — very high latitude (near pole)
-#     NOTE: Our system uses normalized (lat/180, lon/180) Euclidean
-#     distance, NOT haversine. At high latitudes, longitude degrees
-#     are physically short but carry equal weight in our metric.
-#     So we separate parties mainly by latitude to stay consistent.
-# -----------------------------------------------------------
-scenario(
-    "Arctic research stations",
-    3,
-    [
-        (78.2232, 15.6267),     # Alice: Longyearbyen, Svalbard
-        (78.9000, 15.8000),     # Bob: north of Longyearbyen (~75km)
-        (76.5000, 15.5000),     # Charlie: south of Svalbard (~192km)
-    ],
-    ["Alice", "Bob", "Charlie"],
-    "Bob",
-    "Extreme high latitude. Bob (~75km north) is closer than Charlie (~192km south).",
-)
+# (Arctic research stations removed — 192 km exceeds city-scale)
+# (Equatorial meetup removed — 123 km exceeds city-scale)
 
 # -----------------------------------------------------------
-# 11. Equatorial meetup — near lat=0
-# -----------------------------------------------------------
-scenario(
-    "Equatorial meetup",
-    3,
-    [
-        (-0.1807, 36.8070),     # Alice: Nanyuki, Kenya (equator town)
-        (0.0236, 37.0662),      # Bob: Meru (~32km)
-        (-1.2921, 36.8219),     # Charlie: Nairobi (~123km)
-    ],
-    ["Alice", "Bob", "Charlie"],
-    "Bob",
-    "Straddling the equator in Kenya. Meru is much closer than Nairobi.",
-)
-
-# -----------------------------------------------------------
-# 12. Ride-share pickup — who's the closest driver?
+# 10. Ride-share pickup — who's the closest driver?
 # -----------------------------------------------------------
 scenario(
     "Ride-share pickup",
@@ -445,21 +475,7 @@ scenario(
     "Delivery: 4 restaurants, Nob Hill (~0.5km) is nearest to the customer in SF.",
 )
 
-# -----------------------------------------------------------
-# 15. New Zealand — large eastern longitudes
-# -----------------------------------------------------------
-scenario(
-    "New Zealand meetup",
-    3,
-    [
-        (-36.8485, 174.7633),   # Alice: Auckland
-        (-37.7870, 175.2793),   # Bob: Hamilton (~116km)
-        (-41.2865, 174.7762),   # Charlie: Wellington (~493km)
-    ],
-    ["Alice", "Bob", "Charlie"],
-    "Bob",
-    "New Zealand longitudes near 175 deg. Hamilton is closer to Auckland than Wellington.",
-)
+# (New Zealand meetup removed — 493 km exceeds city-scale)
 
 
 # ============================================================
@@ -493,7 +509,7 @@ def run_all():
         server = start_server()
         try:
             t0 = time.time()
-            ok, actual, values, active = run_scenario(
+            ok, actual, values, active, nonce_ok, proof_ok, chat_ok = run_scenario(
                 s["n"], s["locations"], s["names"], s["expected"], s["description"]
             )
             elapsed = time.time() - t0
@@ -504,9 +520,19 @@ def run_all():
                 print(f"{s['names'][si]}={values[si]:.3f}  ", end="")
             print()
 
-            if ok:
+            # Print nonce/proof/chat verification
+            print(f"  Nonce verified: {'✓' if nonce_ok else '✗'}  "
+                  f"Proof verified: {'✓' if proof_ok else '✗'}  "
+                  f"Chat E2E: {'✓' if chat_ok else '✗'}")
+
+            all_verified = nonce_ok and proof_ok and chat_ok
+            if ok and all_verified:
                 print(f"  PASS  ({elapsed:.1f}s)  nearest='{actual}'")
                 passed_count += 1
+            elif ok and not all_verified:
+                print(f"  FAIL  ({elapsed:.1f}s)  nearest correct but "
+                      f"nonce={nonce_ok} proof={proof_ok} chat={chat_ok}")
+                failed_tests.append(s["name"])
             else:
                 print(f"  FAIL  ({elapsed:.1f}s)  expected='{s['expected']}', got='{actual}'")
                 failed_tests.append(s["name"])

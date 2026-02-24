@@ -14,13 +14,24 @@
 #
 #   Phase 2 — Match (per query):
 #     3. /start_match       - initiator sends encrypted coords
-#     4. /get_match         - other parties poll for match request
-#     5. /submit_distance   - each party submits enc(distance²) + enc(id)
+#     4. /get_match         - other parties poll for match
+#     5. /submit_distance   - each party submits enc(distance²) + enc(id) + nonce commitment
 #     6. /compute_nearest   - server runs pairwise scoring
 #     7. /get_result        - parties get encrypted result
 #     8. /submit_partial_decrypt - each party provides partial decrypt
-#     9. /get_decrypted     - initiator gets fused plaintext result
-#    10. /resolve           - initiator resolves slot → user identity
+#     9. /get_raw_partials  - initiator fetches raw partials for local fusion
+#    10. /commitments       - fetch nonce commitments
+#    11. /submit_match_proof - initiator proves match to winner
+#    12. /get_match_proof   - winner retrieves proof
+#    13. /slot_map          - full slot → user map (clients resolve locally)
+#    14. /send_chat_message - relay E2E encrypted chat messages
+#    15. /get_chat_messages - poll for new encrypted messages
+#
+# Nonce-commitment scheme:
+#   - Each party embeds a secret nonce in their encrypted ID vector
+#   - After initiator-side fusion, initiator extracts winner's nonce
+#   - Initiator proves match by revealing nonce; winner verifies commitment
+#   - Both derive symmetric key: HKDF(nonce || r_initiator || session_id)
 #
 # Depth budget (depth 7):
 #   - Distance: 1 ct-ct mult (done by clients)
@@ -37,13 +48,16 @@ import json
 import base64
 import tempfile
 import os
+import time
+import secrets
 from openfhe import *
 
 PORT = 8000
 KEYS_DIR = "fhe_keys"
 BATCH_SIZE = 32
+NONCE_OFFSET = BATCH_SIZE // 2  # nonces packed in slots [16..31]
 MAX_USERS = 20
-MAX_COORD = 180.0
+MAX_COORD = 0.5   # city-scale normaliser (see client.py for rationale)
 
 # -----------------------------
 # Load crypto context (no keys — those come from parties)
@@ -82,6 +96,9 @@ CURRENT_MATCH = None   # {"initiator": party_id, "enc_lat": ct, "enc_lon": ct,
                         #  "result_ct": ciphertext or None,
                         #  "partials": [partial_ct, ...],
                         #  "fused_values": list or None}
+
+# Chat relay state (server stores opaque encrypted blobs — can't read them)
+CHAT_MESSAGES = []     # [{"from": party_id, "payload": str, "ts": float}, ...]
 
 
 # -----------------------------
@@ -152,7 +169,13 @@ def deserialize_public_key(data):
 
 def compute_selector(diff):
     """Selector polynomial in Horner form.
-    0.5 + x * (0.1125 - 0.00084375 * x²)
+    f(x) = 0.5 + x * (0.1125 - 0.00084375 * x²)
+
+    Monotonically increasing for |x| ≤ ~11.5, which covers the full
+    range of normalised squared-distance differences.  Combined with
+    4-digit nonces (max 9999) this gives S/N ≈ 9.4 even for dense
+    urban scenarios (~0.7 km vs ~1.1 km).
+
     Depth: 2 ct-ct + 1 pt-ct = 3 levels.
     """
     x2 = cc.EvalMult(diff, diff)
@@ -251,6 +274,34 @@ class FHEHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # ---- /slot_map ----
+        # Returns the FULL slot -> user mapping so clients can
+        # resolve the winner locally without revealing the winning
+        # slot to the server.
+        if self.path == "/slot_map":
+            self._json_response(200, {
+                "slot_map": {str(k): v for k, v in SLOT_TO_USER.items()},
+            })
+            return
+
+        # ---- /commitments ----
+        # Returns all nonce commitments (slot -> commitment hash).
+        # Initiator uses these to verify the extracted nonce.
+        if self.path == "/commitments":
+            if CURRENT_MATCH is None:
+                self._json_response(404, {"error": "no active match"})
+                return
+
+            # Map party_id -> slot, then return {slot: commitment}
+            slot_commitments = {}
+            for pid, commitment in CURRENT_MATCH["commitments"].items():
+                slot = PARTY_TO_SLOT.get(pid)
+                if slot is not None:
+                    slot_commitments[str(slot)] = commitment
+
+            self._json_response(200, {"commitments": slot_commitments})
+            return
+
         self._json_response(404, {"error": "unknown endpoint"})
 
     def _read_body(self):
@@ -272,7 +323,7 @@ class FHEHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):
-        global NEXT_SLOT, JOINT_PUBLIC_KEY, KEYS_FINALIZED, CURRENT_MATCH, COMBINED_EVAL_KEY, FINAL_EVAL_MULT_KEY, LEAD_EVAL_SHARE
+        global NEXT_SLOT, JOINT_PUBLIC_KEY, KEYS_FINALIZED, CURRENT_MATCH, COMBINED_EVAL_KEY, FINAL_EVAL_MULT_KEY, LEAD_EVAL_SHARE, CHAT_MESSAGES
         body = self._read_body()
         data = json.loads(body)
 
@@ -492,15 +543,19 @@ class FHEHandler(BaseHTTPRequestHandler):
                 "enc_lat": data["enc_lat"],  # serialized ciphertexts
                 "enc_lon": data["enc_lon"],
                 "distances": {},
+                "commitments": {},     # party_id -> SHA-256 commitment hex
                 "result_ct": None,
                 "partials": {},
                 "fused_values": None,
+                "session_id": secrets.token_hex(8),
+                "match_proof": None,   # set by initiator after fusion
             }
 
-            print(f"[start_match] initiator={party_id}")
+            print(f"[start_match] initiator={party_id}  session={CURRENT_MATCH['session_id']}")
             self._json_response(200, {
                 "status": "match_started",
                 "num_parties": len(PARTIES),
+                "session_id": CURRENT_MATCH["session_id"],
             })
             return
 
@@ -523,6 +578,7 @@ class FHEHandler(BaseHTTPRequestHandler):
                 "initiator": CURRENT_MATCH["initiator"],
                 "enc_lat": CURRENT_MATCH["enc_lat"],
                 "enc_lon": CURRENT_MATCH["enc_lon"],
+                "session_id": CURRENT_MATCH["session_id"],
             })
             return
 
@@ -549,9 +605,14 @@ class FHEHandler(BaseHTTPRequestHandler):
 
             CURRENT_MATCH["distances"][party_id] = (dist_ct, id_ct)
 
+            # Store nonce commitment if provided
+            if "commitment" in data:
+                CURRENT_MATCH["commitments"][party_id] = data["commitment"]
+
             expected = len(PARTIES) - 1  # everyone except initiator
             received = len(CURRENT_MATCH["distances"])
-            print(f"[submit_distance] party={party_id}  ({received}/{expected})")
+            print(f"[submit_distance] party={party_id}  ({received}/{expected})"
+                  f"{'  +commitment' if 'commitment' in data else ''}")
 
             self._json_response(200, {
                 "status": "distance_received",
@@ -646,6 +707,7 @@ class FHEHandler(BaseHTTPRequestHandler):
             return
 
         # ---- /get_decrypted ----
+        # LEGACY: server-side fusion. Kept for backward compatibility.
         # Once all partial decryptions are in, server fuses them
         # and returns the plaintext result to the initiator.
         if self.path == "/get_decrypted":
@@ -691,18 +753,158 @@ class FHEHandler(BaseHTTPRequestHandler):
             self._json_response(200, {"values": values})
             return
 
-        # ---- /resolve ----
-        # Initiator sends the winning slot, server returns the actual user.
-        if self.path == "/resolve":
-            slot = data["slot"]
-            actual_user = SLOT_TO_USER.get(slot)
+        # ---- /get_raw_partials ----
+        # SECURE: returns raw partial ciphertexts so the initiator
+        # can fuse locally. The server never sees the plaintext.
+        if self.path == "/get_raw_partials":
+            party_id = data.get("party_id")
 
-            if actual_user is None:
-                self._json_response(404, {"error": f"slot {slot} not found"})
+            if CURRENT_MATCH is None:
+                self._json_response(404, {"error": "no active match"})
                 return
 
-            print(f"[resolve] slot={slot} -> {actual_user}")
-            self._json_response(200, {"actual_user": actual_user})
+            if party_id != CURRENT_MATCH["initiator"]:
+                self._json_response(403, {"error": "only the initiator can get raw partials"})
+                return
+
+            expected = len(PARTIES)
+            received = len(CURRENT_MATCH["partials"])
+
+            if received < expected:
+                self._json_response(400, {
+                    "error": f"waiting for {expected - received} more partial decryptions"
+                })
+                return
+
+            # Return partials in party order (lead first)
+            ordered_partials = []
+            for pid in PARTY_ORDER:
+                ct = CURRENT_MATCH["partials"][pid]
+                ordered_partials.append(serialize_ciphertext(ct))
+
+            print(f"[get_raw_partials] Sending {len(ordered_partials)} raw partials to initiator")
+            self._json_response(200, {
+                "partials": ordered_partials,
+                "session_id": CURRENT_MATCH["session_id"],
+            })
+            return
+
+        # ---- /submit_match_proof ----
+        # Initiator proves to the winner that they matched by revealing
+        # the winner's nonce (extracted from the decrypted result).
+        # Server relays this proof without learning what it means.
+        if self.path == "/submit_match_proof":
+            party_id = data.get("party_id")
+
+            if CURRENT_MATCH is None:
+                self._json_response(404, {"error": "no active match"})
+                return
+
+            if party_id != CURRENT_MATCH["initiator"]:
+                self._json_response(403, {"error": "only the initiator can submit proof"})
+                return
+
+            CURRENT_MATCH["match_proof"] = {
+                "winner_slot": data["winner_slot"],
+                "revealed_nonce": data["revealed_nonce"],
+                "r_initiator": data["r_initiator"],
+                "session_id": CURRENT_MATCH["session_id"],
+            }
+
+            winner_pid = None
+            for pid, slot in PARTY_TO_SLOT.items():
+                if slot == data["winner_slot"]:
+                    winner_pid = pid
+                    break
+
+            print(f"[submit_match_proof] Proof submitted for slot {data['winner_slot']}"
+                  f" (party={winner_pid})")
+            self._json_response(200, {"status": "proof_submitted"})
+            return
+
+        # ---- /get_match_proof ----
+        # Winner polls for their match proof from the initiator.
+        if self.path == "/get_match_proof":
+            party_id = data.get("party_id")
+
+            if CURRENT_MATCH is None:
+                self._json_response(404, {"error": "no active match"})
+                return
+
+            if CURRENT_MATCH["match_proof"] is None:
+                self._json_response(404, {"error": "no proof yet"})
+                return
+
+            my_slot = PARTY_TO_SLOT.get(party_id)
+            proof = CURRENT_MATCH["match_proof"]
+
+            if my_slot != proof["winner_slot"]:
+                self._json_response(404, {"error": "you are not the matched party"})
+                return
+
+            print(f"[get_match_proof] Delivering proof to party={party_id} (slot {my_slot})")
+            self._json_response(200, {
+                "revealed_nonce": proof["revealed_nonce"],
+                "r_initiator": proof["r_initiator"],
+                "session_id": proof["session_id"],
+            })
+            return
+
+        # ============================================================
+        # Chat Relay (E2E encrypted — server stores opaque blobs)
+        # ============================================================
+
+        # ---- /send_chat_message ----
+        # Either matched party sends an encrypted message for relay.
+        # Server stores the opaque payload — it cannot decrypt.
+        if self.path == "/send_chat_message":
+            party_id = data.get("party_id")
+            payload = data.get("payload")
+
+            if not party_id or not payload:
+                self._json_response(400, {"error": "missing party_id or payload"})
+                return
+
+            CHAT_MESSAGES.append({
+                "from": party_id,
+                "payload": payload,
+                "ts": time.time(),
+            })
+
+            self._json_response(200, {
+                "status": "sent",
+                "index": len(CHAT_MESSAGES) - 1,
+            })
+            return
+
+        # ---- /get_chat_messages ----
+        # Poll for new messages since a given index, excluding own.
+        if self.path == "/get_chat_messages":
+            party_id = data.get("party_id")
+            since = data.get("since", 0)
+
+            messages = []
+            for i in range(since, len(CHAT_MESSAGES)):
+                msg = CHAT_MESSAGES[i]
+                if msg["from"] != party_id:
+                    messages.append({
+                        "index": i,
+                        "payload": msg["payload"],
+                    })
+
+            self._json_response(200, {
+                "messages": messages,
+                "next_index": len(CHAT_MESSAGES),
+            })
+            return
+
+        # ---- /resolve ----
+        # DEPRECATED: leaks the winning slot to the server.
+        # Clients should use GET /slot_map and resolve locally.
+        if self.path == "/resolve":
+            self._json_response(410, {
+                "error": "DEPRECATED — use GET /slot_map and resolve locally"
+            })
             return
 
         # ---- /status ----

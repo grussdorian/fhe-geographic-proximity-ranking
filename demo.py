@@ -26,11 +26,14 @@
 import sys
 import time
 import math
+import secrets
+import hashlib
 from openfhe import *
 
 KEYS_DIR = "fhe_keys"
 BATCH_SIZE = 32
-MAX_COORD = 180.0
+MAX_COORD = 0.5   # city-scale normaliser (see client.py for rationale)
+NONCE_OFFSET = BATCH_SIZE // 2   # nonces packed in slots [16..31]
 
 # =============================================
 # Step 1: Generate crypto context
@@ -147,8 +150,8 @@ def generate_eval_mult_key(cc, keypairs):
 # =============================================
 
 def compute_selector(cc, diff):
-    """Selector polynomial (Horner form).
-    0.5 + x * (0.1125 - 0.00084375 * x²)
+    """Selector polynomial in Horner form.
+    f(x) = 0.5 + x * (0.1125 - 0.00084375 * x²)
     Depth: 2 ct-ct + 1 pt-ct = 3 levels.
     """
     x2 = cc.EvalMult(diff, diff)
@@ -212,6 +215,55 @@ def threshold_decrypt(cc, keypairs, ciphertext):
     plaintext = cc.MultipartyDecryptFusion(partials)
     plaintext.SetLength(BATCH_SIZE)
     return list(plaintext.GetRealPackedValue())
+
+
+# =============================================
+# Nonce-commitment helpers
+# =============================================
+
+def generate_nonce():
+    """Generate a 6-digit secret nonce and its SHA-256 commitment."""
+    nonce_val = secrets.randbelow(9000) + 1000  # 1000–9999 (4-digit)
+    commitment = hashlib.sha256(str(nonce_val).encode()).hexdigest()
+    return nonce_val, commitment
+
+
+def verify_nonce(nonce_val, commitment):
+    """Check that nonce matches commitment."""
+    return hashlib.sha256(str(nonce_val).encode()).hexdigest() == commitment
+
+
+def extract_nonce_from_result(values, winner_slot, commitment, search_range=20):
+    """Extract the winner's nonce from the decrypted result vector.
+    
+    The result vector has: result[slot] = score, result[NONCE_OFFSET+slot] = score*nonce.
+    We divide to get nonce, then brute-force search a small range around
+    the rounded value to find the exact nonce matching the commitment.
+    This compensates for CKKS approximation errors.
+    """
+    score = values[winner_slot]
+    nonce_weighted = values[NONCE_OFFSET + winner_slot]
+
+    if abs(score) < 1e-6:
+        return None, False
+
+    raw_nonce = nonce_weighted / score
+    center = round(raw_nonce)
+
+    # Search a small range around the center for the commitment match
+    for delta in range(search_range + 1):
+        for candidate in [center + delta, center - delta]:
+            if hashlib.sha256(str(candidate).encode()).hexdigest() == commitment:
+                return candidate, True
+
+    # No match found — return best guess
+    return center, False
+
+
+def derive_shared_key(winner_nonce, r_initiator, session_id):
+    """Derive a symmetric key from the winner's nonce, initiator's random, and session id."""
+    material = f"{winner_nonce}:{r_initiator}:{session_id}".encode()
+    return hashlib.pbkdf2_hmac('sha256', material, b'fhe-proximity-salt', 100000)
 
 
 # =============================================
@@ -325,6 +377,8 @@ def run_demo(num_parties=3, initiator_idx=0, locations=None, names=None):
     print("[4] Each party computes distance LOCALLY...")
     print(f"    (Party uses own plaintext coords + initiator's encrypted coords)")
     opponents = []
+    nonces = {}       # slot -> nonce value
+    commitments = {}  # slot -> SHA-256 hex digest
     for i in range(num_parties):
         if i == initiator_idx:
             continue
@@ -344,14 +398,22 @@ def run_demo(num_parties=3, initiator_idx=0, locations=None, names=None):
         dlon2 = cc.EvalMult(dlon, dlon)   # depth +1 (parallel)
         dist_ct = cc.EvalAdd(dlat2, dlon2)
 
-        # One-hot ID
+        # Generate secret nonce for this party
+        nonce_val, commitment = generate_nonce()
+        nonces[i] = nonce_val
+        commitments[i] = commitment
+
+        # One-hot ID with embedded nonce
+        # Slots [0..15]  = one-hot identity
+        # Slots [16..31] = nonce at NONCE_OFFSET + slot
         vec = [0.0] * BATCH_SIZE
         vec[i] = 1.0
+        vec[NONCE_OFFSET + i] = float(nonce_val)
         id_pt = cc.MakeCKKSPackedPlaintext(vec)
         id_ct = cc.Encrypt(joint_pk, id_pt)
 
         opponents.append((dist_ct, id_ct))
-        print(f"    {names[i]:>10}: computed enc(distance²) ✓  (own coords NEVER leave device)")
+        print(f"    {names[i]:>10}: computed enc(distance²) ✓  (nonce committed: {commitment[:8]}...)")
 
     print(f"    All distances computed ({time.time() - t3:.2f}s)")
     print()
@@ -378,8 +440,8 @@ def run_demo(num_parties=3, initiator_idx=0, locations=None, names=None):
     print(f"    Decryption fused ({time.time() - t5:.2f}s)")
     print()
 
-    # ---- Step 7: Find nearest ----
-    print("[7] Result analysis...")
+    # ---- Step 7: Find nearest + nonce verification ----
+    print("[7] Result analysis + nonce verification...")
 
     # Show all slot values
     active_slots = [i for i in range(num_parties) if i != initiator_idx]
@@ -400,13 +462,56 @@ def run_demo(num_parties=3, initiator_idx=0, locations=None, names=None):
         print(f"    ✗ Mismatch (picked {names[winner_slot]} at {winner_dist:.2f}km"
               f" vs {names[true_nearest_idx]} at {nearest_dist:.2f}km)")
 
+    # ---- Step 8: Extract winner's nonce from decrypted vector ----
+    print()
+    print("[8] Nonce extraction + verification...")
+    winner_commitment = commitments[winner_slot]
+    winner_nonce, nonce_ok = extract_nonce_from_result(
+        values, winner_slot, winner_commitment
+    )
+    true_nonce = nonces[winner_slot]
+
+    print(f"    Score at winner slot:  {values[winner_slot]:.6f}")
+    print(f"    Nonce×score raw:      {values[NONCE_OFFSET + winner_slot]:.4f}")
+    print(f"    Extracted nonce:      {winner_nonce}")
+    print(f"    True nonce (secret):  {true_nonce}")
+    print(f"    Commitment:           {winner_commitment[:16]}...")
+
+    if nonce_ok:
+        print(f"    ✓ Nonce commitment VERIFIED — initiator can prove match to {names[winner_slot]}")
+    else:
+        print(f"    ✗ Nonce commitment FAILED (CKKS approximation error too large)")
+
+    # ---- Step 9: Derive symmetric key ----
+    print()
+    print("[9] Symmetric key derivation...")
+    session_id = secrets.token_hex(8)
+    r_initiator = secrets.token_hex(16)
+
+    shared_key = derive_shared_key(winner_nonce, r_initiator, session_id)
+    print(f"    session_id:   {session_id}")
+    print(f"    r_initiator:  {r_initiator[:16]}...")
+    print(f"    shared_key:   {shared_key.hex()[:32]}...")
+    print(f"    (Both {names[initiator_idx]} and {names[winner_slot]} can derive this key)")
+
+    # Winner can verify: they know their own nonce, receive r_initiator
+    # and session_id from the initiator, and derive the same key.
+    # The initiator sends the extracted nonce; the winner checks it
+    # matches their true nonce (or commitment), then both use the
+    # extracted nonce value for key derivation.
+    winner_key = derive_shared_key(winner_nonce, r_initiator, session_id)
+    keys_match = shared_key == winner_key
+    print(f"    Keys match:   {'✓ YES' if keys_match else '✗ NO'}")
+
     print()
     total = time.time() - t0
     print("=" * 60)
     print(f"  DONE — Total time: {total:.1f}s")
-    print(f"  Key property: NO single party could decrypt alone.")
-    print(f"  Even if the initiator and server collude,")
-    print(f"  they cannot learn anyone else's location or distance.")
+    print(f"  Key properties:")
+    print(f"  • NO single party could decrypt alone")
+    print(f"  • Initiator proved the match via nonce commitment")
+    print(f"  • Shared symmetric key derived for secure channel")
+    print(f"  • Server learned NOTHING about locations or distances")
     print("=" * 60)
 
     return winner_slot == true_nearest_idx

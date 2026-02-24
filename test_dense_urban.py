@@ -35,7 +35,7 @@ import math
 # ==========================================
 
 BATCH_SIZE = 32
-MAX_COORD = 180.0
+MAX_COORD = 0.5   # city-scale normaliser (see client.py for rationale)
 MAX_USERS = 20
 NUM_BASE_PARTIES = 3
 
@@ -134,6 +134,7 @@ def partial_decrypt(cc, keypairs, ciphertext, party_indices):
 # ==========================================
 
 def compute_selector(cc, diff):
+    """Selector polynomial (Horner form)."""
     x2 = cc.EvalMult(diff, diff)
     inner = cc.EvalMult(x2, -0.00084375)
     inner = cc.EvalAdd(inner, 0.1125)
@@ -240,7 +241,8 @@ def run_scoring(target_idx, locs, names, cc=None, keypairs=None, joint_pk=None):
     elapsed = time.time() - t0
 
     values = threshold_decrypt(cc, keypairs, result_ct)
-    winner_slot = max(range(len(values)), key=lambda i: values[i])
+    candidates = [i for i in range(n) if i != target_idx]
+    winner_slot = max(candidates, key=lambda i: values[i])
 
     return winner_slot, values, elapsed
 

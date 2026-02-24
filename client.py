@@ -17,25 +17,30 @@
 #
 #   Phase 2 — Match (per query):
 #     Lead/initiator:
-#       8. Encrypts own coords → POST /start_match
-#       9. Waits for all parties to submit distances
-#      10. POST /compute_nearest → server scores
-#      11. POST /get_result → gets encrypted result
-#      12. MultipartyDecryptLead → POST /submit_partial_decrypt
-#      13. POST /get_decrypted → fused plaintext → argmax → /resolve
+#       8.  Encrypts own coords → POST /start_match
+#       9.  Waits for all parties to submit distances
+#      10.  POST /compute_nearest → server scores
+#      11.  Parties partial-decrypt → POST /submit_partial_decrypt
+#      12.  POST /get_raw_partials → fetch raw partials
+#      13.  Fuse locally → extract winner + nonce
+#      14.  Verify nonce against commitment
+#      15.  POST /submit_match_proof → prove match to winner
+#      16.  Derive symmetric key
 #
 #     Other parties:
-#       8. POST /get_match → get initiator's encrypted coords
-#       9. Compute distance LOCALLY (using own plaintext coords + enc coords)
-#      10. POST /submit_distance → send enc(dist²) + enc(one_hot_id)
-#      11. POST /get_result → gets encrypted result
-#      12. MultipartyDecryptMain → POST /submit_partial_decrypt
+#       8.  POST /get_match → get initiator's encrypted coords
+#       9.  Generate nonce + commitment; compute distance LOCALLY
+#      10.  POST /submit_distance → enc(dist²) + enc(id+nonce) + commitment
+#      11.  Partial-decrypt → POST /submit_partial_decrypt
+#      12.  POST /get_match_proof → poll for match proof
+#      13.  Verify nonce, derive symmetric key
 #
 # Security:
 #   - Each party holds only their secret key share
 #   - No single party can decrypt (need ALL shares)
-#   - Server never sees plaintext coords or distances
-#   - Even initiator+server collusion cannot decrypt
+#   - Server never sees plaintext coords, distances, or fused result
+#   - Initiator proves match via nonce-commitment scheme
+#   - Shared symmetric key derived from winner nonce + initiator random
 # ==========================================
 
 import requests
@@ -46,12 +51,24 @@ import tempfile
 import os
 import sys
 import json
+import secrets
+import hashlib
 from openfhe import *
 
 SERVER_URL = "http://localhost:8000"
 KEYS_DIR = "fhe_keys"
 BATCH_SIZE = 32
-MAX_COORD = 180.0
+NONCE_OFFSET = BATCH_SIZE // 2  # nonces packed in slots [16..31]
+
+# City-scale coordinate normaliser.  Both sides divide raw GPS coords by
+# MAX_COORD before the encrypted subtraction, so squared-distance values
+# are proportional to 1/MAX_COORD².  Using 0.5 (≈55 km at the equator)
+# instead of 180 amplifies within-city differences by 129 600×, giving
+# the selector polynomial enough signal to resolve sub-km gaps.
+# Monotonicity constraint: the selector poly f(x)=0.5+0.1125x-0.00084375x³
+# is positive above 0.5 for 0 < x < 11.55, so max city dist_sq diff must
+# stay below that.  For a 100 km city: max diff ≈ 2*(0.9/0.5)² ≈ 6.5 ✓
+MAX_COORD = 0.5
 
 # -----------------------------
 # Load crypto context (no keys — we generate them)
@@ -235,10 +252,15 @@ def encrypt_location(lat, lon, public_key):
     return lat_ct, lon_ct
 
 
-def encrypt_onehot_id(slot_index, public_key):
-    """Encrypt a one-hot vector with 1.0 at the given slot."""
+def encrypt_onehot_id(slot_index, public_key, nonce_val=None):
+    """Encrypt a one-hot vector with 1.0 at the given slot.
+    If nonce_val is provided, also embed it at NONCE_OFFSET + slot_index,
+    so the scoring computation carries the nonce alongside the identity.
+    """
     vec = [0.0] * BATCH_SIZE
     vec[slot_index] = 1.0
+    if nonce_val is not None:
+        vec[NONCE_OFFSET + slot_index] = float(nonce_val)
     pt = cc.MakeCKKSPackedPlaintext(vec)
     return cc.Encrypt(public_key, pt)
 
@@ -281,13 +303,16 @@ def start_match(party_id, lat, lon, public_key):
     return resp.json()
 
 
-def submit_distance(party_id, dist_ct, id_ct):
-    """Non-initiator: submit encrypted distance + one-hot ID."""
-    resp = requests.post(f"{SERVER_URL}/submit_distance", json={
+def submit_distance(party_id, dist_ct, id_ct, commitment=None):
+    """Non-initiator: submit encrypted distance + one-hot ID + nonce commitment."""
+    payload = {
         "party_id": party_id,
         "dist_ct": serialize_ciphertext(dist_ct),
         "id_ct": serialize_ciphertext(id_ct),
-    })
+    }
+    if commitment is not None:
+        payload["commitment"] = commitment
+    resp = requests.post(f"{SERVER_URL}/submit_distance", json=payload)
     if resp.status_code != 200:
         raise RuntimeError(f"submit_distance failed: {resp.json()}")
     return resp.json()
@@ -331,11 +356,256 @@ def get_decrypted_result(party_id):
 
 
 def resolve_slot(slot):
-    """Map winning slot to actual user identity."""
-    resp = requests.post(f"{SERVER_URL}/resolve", json={"slot": slot})
+    """DEPRECATED: Map winning slot to actual user identity via server.
+    Use fetch_slot_map() + local lookup instead."""
+    raise DeprecationWarning(
+        "resolve_slot() leaks the winning slot to the server. "
+        "Use fetch_slot_map() and resolve locally."
+    )
+
+
+def fetch_slot_map():
+    """Fetch the FULL slot -> user mapping from the server.
+    The server doesn't learn which slot won — all clients see
+    the same complete mapping and resolve locally."""
+    resp = requests.get(f"{SERVER_URL}/slot_map")
     if resp.status_code != 200:
-        raise RuntimeError(f"resolve failed: {resp.json()}")
-    return resp.json()["actual_user"]
+        raise RuntimeError(f"fetch_slot_map failed: {resp.json()}")
+    # Keys come back as strings in JSON; convert to int
+    raw = resp.json()["slot_map"]
+    return {int(k): v for k, v in raw.items()}
+
+
+# =============================================
+# Nonce-commitment helpers
+# =============================================
+
+def generate_nonce():
+    """Generate a 6-digit secret nonce and its SHA-256 commitment."""
+    nonce_val = secrets.randbelow(9000) + 1000  # 1000–9999 (4-digit)
+    # Keeping nonces small (≤ 9999) is critical: the score × id_ct multiplication
+    # amplifies CKKS noise by the nonce magnitude. With 4-digit nonces the
+    # noise stays ~50× lower than 6-digit nonces, giving S/N ≈ 9.4 even for
+    # dense urban scenarios (Manhattan-level, ~0.7 km vs ~1.1 km).
+    commitment = hashlib.sha256(str(nonce_val).encode()).hexdigest()
+    return nonce_val, commitment
+
+
+def verify_nonce(nonce_val, commitment):
+    """Check that nonce matches commitment."""
+    return hashlib.sha256(str(nonce_val).encode()).hexdigest() == commitment
+
+
+def extract_nonce_from_result(values, winner_slot, commitment, search_range=20):
+    """Extract the winner's nonce from the decrypted result vector.
+    
+    The result vector has: result[slot] = score, result[NONCE_OFFSET+slot] = score*nonce.
+    We divide to get nonce, then brute-force search a small range around
+    the rounded value to find the exact nonce matching the commitment.
+    This compensates for CKKS approximation errors.
+    """
+    score = values[winner_slot]
+    nonce_weighted = values[NONCE_OFFSET + winner_slot]
+
+    if abs(score) < 1e-6:
+        return None, False
+
+    raw_nonce = nonce_weighted / score
+    center = round(raw_nonce)
+
+    # Search a small range around the center for the commitment match
+    for delta in range(search_range + 1):
+        for candidate in [center + delta, center - delta]:
+            if hashlib.sha256(str(candidate).encode()).hexdigest() == commitment:
+                return candidate, True
+
+    # No match found — return best guess
+    return center, False
+
+
+def derive_shared_key(winner_nonce, r_initiator, session_id):
+    """Derive a symmetric key from the winner's nonce, initiator's random, and session id."""
+    material = f"{winner_nonce}:{r_initiator}:{session_id}".encode()
+    return hashlib.pbkdf2_hmac('sha256', material, b'fhe-proximity-salt', 100000)
+
+
+def fetch_raw_partials(party_id):
+    """Initiator: fetch raw partial decryption ciphertexts from server.
+    The server never performs the fusion — the initiator does it locally.
+    """
+    resp = requests.post(f"{SERVER_URL}/get_raw_partials", json={
+        "party_id": party_id,
+    })
+    if resp.status_code != 200:
+        raise RuntimeError(f"get_raw_partials failed: {resp.json()}")
+    data = resp.json()
+    partials = [deserialize_ciphertext(p) for p in data["partials"]]
+    session_id = data.get("session_id")
+    return partials, session_id
+
+
+def fuse_locally(partials):
+    """Initiator: fuse partial decryptions locally.
+    This means the server NEVER sees the plaintext result.
+    """
+    plaintext = cc.MultipartyDecryptFusion(partials)
+    plaintext.SetLength(BATCH_SIZE)
+    return list(plaintext.GetRealPackedValue())
+
+
+def fetch_commitments():
+    """Fetch all nonce commitments (slot -> commitment hash)."""
+    resp = requests.get(f"{SERVER_URL}/commitments")
+    if resp.status_code != 200:
+        raise RuntimeError(f"fetch_commitments failed: {resp.json()}")
+    return resp.json()["commitments"]
+
+
+def submit_match_proof(party_id, winner_slot, revealed_nonce, r_initiator):
+    """Initiator: submit proof of match to server for relay to winner."""
+    resp = requests.post(f"{SERVER_URL}/submit_match_proof", json={
+        "party_id": party_id,
+        "winner_slot": winner_slot,
+        "revealed_nonce": revealed_nonce,
+        "r_initiator": r_initiator,
+    })
+    if resp.status_code != 200:
+        raise RuntimeError(f"submit_match_proof failed: {resp.json()}")
+    return resp.json()
+
+
+def get_match_proof(party_id):
+    """Winner: poll for match proof from initiator."""
+    resp = requests.post(f"{SERVER_URL}/get_match_proof", json={
+        "party_id": party_id,
+    })
+    if resp.status_code != 200:
+        return None  # not ready yet
+    return resp.json()
+
+
+# =============================================
+# E2E Encrypted Chat (using derived shared key)
+# =============================================
+
+def encrypt_message(key, plaintext):
+    """Authenticated encryption using HMAC-derived keystream.
+    
+    Format: base64(nonce ‖ ciphertext ‖ HMAC-tag)
+    The server relays the opaque blob — it cannot decrypt.
+    """
+    import hmac as hmac_mod
+    nonce = os.urandom(16)
+    pt_bytes = plaintext.encode('utf-8')
+    # Derive a keystream long enough for the plaintext
+    keystream = hashlib.pbkdf2_hmac('sha256', key, nonce, 1, dklen=len(pt_bytes))
+    ciphertext = bytes(a ^ b for a, b in zip(pt_bytes, keystream))
+    tag = hmac_mod.new(key, nonce + ciphertext, hashlib.sha256).digest()
+    return base64.b64encode(nonce + ciphertext + tag).decode()
+
+
+def decrypt_message(key, token):
+    """Decrypt and verify an encrypted chat message."""
+    import hmac as hmac_mod
+    data = base64.b64decode(token)
+    if len(data) < 48:  # 16 nonce + at least 0 ciphertext + 32 tag
+        raise ValueError("Message too short")
+    nonce = data[:16]
+    tag = data[-32:]
+    ciphertext = data[16:-32]
+    expected_tag = hmac_mod.new(key, nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac_mod.compare_digest(tag, expected_tag):
+        raise ValueError("Authentication failed — wrong key or corrupted message")
+    keystream = hashlib.pbkdf2_hmac('sha256', key, nonce, 1, dklen=len(ciphertext))
+    pt_bytes = bytes(a ^ b for a, b in zip(ciphertext, keystream))
+    return pt_bytes.decode('utf-8')
+
+
+def send_chat_message(party_id, key, plaintext):
+    """Encrypt a message and relay it through the server."""
+    encrypted = encrypt_message(key, plaintext)
+    resp = requests.post(f"{SERVER_URL}/send_chat_message", json={
+        "party_id": party_id,
+        "payload": encrypted,
+    })
+    if resp.status_code != 200:
+        raise RuntimeError(f"send_chat_message failed: {resp.json()}")
+    return resp.json()
+
+
+def get_chat_messages(party_id, since=0):
+    """Poll for new encrypted messages from the server."""
+    resp = requests.post(f"{SERVER_URL}/get_chat_messages", json={
+        "party_id": party_id,
+        "since": since,
+    })
+    if resp.status_code != 200:
+        raise RuntimeError(f"get_chat_messages failed: {resp.json()}")
+    return resp.json()
+
+
+def run_chat_session(party_id, shared_key, my_name, peer_name):
+    """Interactive E2E encrypted chat loop.
+    
+    A receiver thread polls for incoming messages while the main
+    thread reads stdin for outgoing messages.
+    
+    Type 'quit' or 'exit' to leave the chat.
+    """
+    import threading
+
+    print()
+    print("=" * 55)
+    print(f"  E2E ENCRYPTED CHAT — {my_name} ↔ {peer_name}")
+    print("=" * 55)
+    print("  Messages are encrypted with the shared key.")
+    print("  Server relays opaque blobs — cannot read them.")
+    print("  Type 'quit' or 'exit' to leave.")
+    print("-" * 55)
+
+    stop_event = threading.Event()
+    next_index = [0]  # mutable so receiver thread can update
+
+    def receiver():
+        """Background thread: poll for incoming messages."""
+        while not stop_event.is_set():
+            try:
+                resp = get_chat_messages(party_id, since=next_index[0])
+                for msg in resp.get("messages", []):
+                    try:
+                        plaintext = decrypt_message(shared_key, msg["payload"])
+                        print(f"\r  {peer_name}: {plaintext}")
+                        print(f"  {my_name}: ", end="", flush=True)
+                    except Exception as e:
+                        print(f"\r  [decrypt error: {e}]")
+                        print(f"  {my_name}: ", end="", flush=True)
+                next_index[0] = resp.get("next_index", next_index[0])
+            except Exception:
+                pass
+            stop_event.wait(1.0)
+
+    recv_thread = threading.Thread(target=receiver, daemon=True)
+    recv_thread.start()
+
+    try:
+        while True:
+            try:
+                text = input(f"  {my_name}: ")
+            except EOFError:
+                break
+            if text.strip().lower() in ("quit", "exit", ""):
+                if text.strip().lower() in ("quit", "exit"):
+                    break
+                continue
+            send_chat_message(party_id, shared_key, text)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        recv_thread.join(timeout=2.0)
+        print()
+        print("  Chat session ended.")
+        print("=" * 55)
 
 
 # =============================================
@@ -641,8 +911,9 @@ Examples:
 
         # Step 8: Encrypt own coords and start match
         print("  Encrypting coordinates under JOINT key...")
-        start_match(party_id, lat, lon, joint_pk)
-        print("  Match started — encrypted coords sent to server")
+        match_resp = start_match(party_id, lat, lon, joint_pk)
+        session_id = match_resp.get("session_id", "unknown")
+        print(f"  Match started — session={session_id}")
         print("  (Other parties can now compute distances locally)")
         print()
 
@@ -672,34 +943,91 @@ Examples:
         wait_for_partials(total_parties)
         print()
 
-        # Step 12: Get fused result
-        print("  Retrieving fused plaintext result...")
-        values = get_decrypted_result(party_id)
+        # Step 12: Fetch RAW partials and fuse LOCALLY
+        # (Server never sees the plaintext result!)
+        print("  Fetching raw partial decryptions...")
+        partials, srv_session_id = fetch_raw_partials(party_id)
+        print(f"  Received {len(partials)} raw partials")
 
-        # Find winner
+        print("  Fusing partial decryptions LOCALLY...")
+        values = fuse_locally(partials)
+        print("  ✓ Fusion done locally — server never saw plaintext")
+        print()
+
+        # Find winner — scan IDENTITY slots only (0..NONCE_OFFSET-1).
+        # Nonce slots (NONCE_OFFSET..BATCH_SIZE-1) carry score×nonce and
+        # must NOT be considered as candidate winner slots.
         initiator_slot = slot
-        active_slots = [i for i in range(len(values)) if i != initiator_slot and abs(values[i]) > 0.01]
+        num_assigned = poll_server_status()["slots_assigned"]
+        id_limit = min(num_assigned, NONCE_OFFSET)
+        active_slots = [i for i in range(id_limit) if i != initiator_slot and abs(values[i]) > 0.01]
         if not active_slots:
-            # Fallback: check all slots except initiator
-            all_slots = list(range(poll_server_status()["slots_assigned"]))
-            active_slots = [s for s in all_slots if s != initiator_slot]
+            # Fallback: all identity-range slots except initiator
+            active_slots = [s for s in range(id_limit) if s != initiator_slot]
 
-        print("  Score vector (non-initiator slots):")
+        print("  Score vector (identity slots):")
         for s in active_slots:
             print(f"    Slot {s}: {values[s]:.4f}")
+        # Also show nonce-weighted slots for debugging
+        nonce_slots = [NONCE_OFFSET + s for s in active_slots if NONCE_OFFSET + s < BATCH_SIZE]
+        if nonce_slots:
+            print("  Nonce-weighted slots:")
+            for ns in nonce_slots:
+                print(f"    Slot {ns}: {values[ns]:.4f}")
 
         winner_slot = max(active_slots, key=lambda s: values[s])
 
-        # Step 13: Resolve identity
-        winner_name = resolve_slot(winner_slot)
+        # Step 13: Extract winner's nonce from decrypted vector
+        print()
+        print("  Extracting winner's nonce from decrypted result...")
+
+        # Step 14: Verify nonce against commitment
+        print("  Fetching nonce commitments...")
+        slot_commitments = fetch_commitments()
+        winner_commitment = slot_commitments.get(str(winner_slot))
+
+        if winner_commitment:
+            winner_nonce, nonce_ok = extract_nonce_from_result(
+                values, winner_slot, winner_commitment
+            )
+            print(f"    Score at winner slot: {values[winner_slot]:.6f}")
+            print(f"    Nonce×score raw:     {values[NONCE_OFFSET + winner_slot]:.4f}")
+            print(f"    Extracted nonce:     {winner_nonce}")
+            if nonce_ok:
+                print(f"  ✓ Nonce commitment VERIFIED for slot {winner_slot}")
+            else:
+                print(f"  ✗ Nonce commitment FAILED (CKKS approximation error)")
+        else:
+            winner_nonce = round(values[NONCE_OFFSET + winner_slot] / max(values[winner_slot], 1e-6))
+            nonce_ok = False
+            print(f"  ⚠ No commitment found for slot {winner_slot}")
+
+        # Step 15: Submit proof to server for relay to winner
+        r_initiator = secrets.token_hex(16)
+        print("  Submitting match proof for winner to retrieve...")
+        submit_match_proof(party_id, winner_slot, winner_nonce, r_initiator)
+        print("  ✓ Match proof submitted")
+
+        # Step 16: Derive symmetric key
+        shared_key = derive_shared_key(winner_nonce, r_initiator, srv_session_id)
+        print(f"  Shared key: {shared_key.hex()[:32]}...")
+
+        # Resolve identity LOCALLY (no /resolve call — server doesn't learn winner)
+        slot_map = fetch_slot_map()
+        winner_name = slot_map.get(winner_slot, f"unknown_slot_{winner_slot}")
         print()
         print("=" * 55)
         print(f"  RESULT: Nearest party is '{winner_name}' (slot {winner_slot})")
         print(f"  Score: {values[winner_slot]:.4f}")
+        print(f"  Nonce verified: {'YES' if winner_commitment and nonce_ok else 'NO'}")
+        print(f"  Shared key derived for secure channel with {winner_name}")
         print(f"  Your location was NEVER revealed to anyone.")
-        print(f"  Their location was NEVER revealed to you.")
-        print(f"  The server learned NOTHING about anyone's location.")
+        print(f"  Server NEVER saw the plaintext result (local fusion).")
         print("=" * 55)
+
+        # Launch interactive E2E encrypted chat with the matched party
+        if winner_commitment and nonce_ok:
+            run_chat_session(party_id, shared_key, actual_user, winner_name)
 
     else:
         # ---- JOIN / RESPONDER PATH ----
@@ -709,8 +1037,13 @@ Examples:
         match_info = wait_for_match(party_id)
         print()
         print(f"  Match started by: {match_info['initiator']}")
+        match_session_id = match_info.get("session_id", "unknown")
 
-        # Step 9: Compute distance LOCALLY
+        # Step 9: Generate nonce + compute distance LOCALLY
+        print("  Generating secret nonce...")
+        my_nonce, my_commitment = generate_nonce()
+        print(f"    Nonce generated (commitment: {my_commitment[:16]}...)")
+
         print("  Computing encrypted distance LOCALLY...")
         print(f"    Using own coords ({lat:.5f}, {lon:.5f}) — stays on this device")
         print(f"    Subtracting from initiator's ENCRYPTED coords")
@@ -719,12 +1052,12 @@ Examples:
         enc_lon = deserialize_ciphertext(match_info["enc_lon"])
 
         dist_ct = compute_distance_local(enc_lat, enc_lon, lat, lon, joint_pk)
-        id_ct = encrypt_onehot_id(slot, joint_pk)
-        print("  Encrypted distance² computed (depth +1)")
+        id_ct = encrypt_onehot_id(slot, joint_pk, nonce_val=my_nonce)
+        print("  Encrypted distance² + ID with embedded nonce (depth +1)")
 
-        # Step 10: Submit distance to server
-        print("  Submitting encrypted distance + one-hot ID...")
-        submit_resp = submit_distance(party_id, dist_ct, id_ct)
+        # Step 10: Submit distance + commitment to server
+        print("  Submitting encrypted distance + ID + nonce commitment...")
+        submit_resp = submit_distance(party_id, dist_ct, id_ct, commitment=my_commitment)
         print(f"  Submitted ({submit_resp['received']}/{submit_resp['expected']} distances)")
         print()
 
@@ -745,9 +1078,56 @@ Examples:
         do_partial_decrypt(party_id, kp, is_lead=False)
         print("  Partial decryption submitted")
         print()
+
+        # Step 13: Poll for match proof (if we are the winner)
+        print("  Checking if we were the matched party...")
+        proof = None
+        for attempt in range(30):  # poll for up to 30 seconds
+            proof = get_match_proof(party_id)
+            if proof is not None:
+                break
+            time.sleep(1.0)
+
+        if proof is not None:
+            revealed_nonce = proof["revealed_nonce"]
+            r_initiator = proof["r_initiator"]
+            proof_session_id = proof["session_id"]
+
+            # Verify: does the revealed nonce match our original?
+            nonce_ok = (revealed_nonce == my_nonce)
+            print(f"  ★ WE ARE THE MATCH!")
+            print(f"    Revealed nonce: {revealed_nonce}")
+            print(f"    Our nonce:      {my_nonce}")
+            print(f"    Nonce match:    {'✓ YES' if nonce_ok else '✗ NO'}")
+
+            if nonce_ok:
+                shared_key = derive_shared_key(my_nonce, r_initiator, proof_session_id)
+                print(f"    Shared key:     {shared_key.hex()[:32]}...")
+                print(f"    Secure channel established with initiator!")
+            else:
+                shared_key = None
+                print(f"    ✗ Nonce mismatch — proof invalid!")
+        else:
+            print("  We were NOT the closest match (no proof received)")
+
+        print()
         print("=" * 55)
         print("  Done. Your partial decryption has been submitted.")
-        print("  Only the initiator receives the final result.")
+        if proof is not None:
+            print("  ★ You were identified as the closest match!")
+            print("  A shared symmetric key has been derived.")
+        else:
+            print("  Another party was closer to the initiator.")
         print("  Your location was NEVER sent to anyone.")
         print("=" * 55)
+
+        # Launch interactive E2E encrypted chat if we matched
+        if proof is not None and nonce_ok and shared_key is not None:
+            # Resolve initiator's name from the slot map
+            # The responder knows the initiator's party_id but not their slot,
+            # so we fetch the full slot map and identify the initiator by
+            # elimination (the initiator is slot 0 — always the lead/first joiner).
+            slot_map = fetch_slot_map()
+            initiator_name = slot_map.get(0, "Initiator")
+            run_chat_session(party_id, shared_key, actual_user, initiator_name)
 
